@@ -2,7 +2,7 @@ import asyncio
 import aiohttp
 import logging
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional, Union
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -41,20 +41,73 @@ class FundingRateBot:
             "bingx": "https://api.bingx.com/openApi/swap/v2/quote/fundingRate",
         }
 
-        # Периодичность выплат (часов между выплатами)
-        # Здесь я специально задал РАЗНЫЕ интервалы:
-        # 8ч, 6ч, 4ч, 2ч, 1ч – чтобы в расчётах и выводе
-        # реально фигурировали разные времена выплат
-        self.funding_intervals = {
-            "binance": 8,  # 3 раза в сутки
-            "bybit": 8,    # 3 раза в сутки
-            "mexc": 8,     # 3 раза в сутки (пока условно)
-            "okx": 8,      # 3 раза в сутки (можно поменять, если знаешь реальные)
-            "htx": 4,      # 6 раз в сутки
-            "lbank": 6,    # 4 раза в сутки
-            "bitget": 8,   # 3 раза в сутки
-            "gate": 2,     # 12 раз в сутки
-            "bingx": 1,    # 24 раза в сутки
+        # ДЕФОЛТНЫЕ интервалы выплат по биржам (в часах)
+        # ❗Здесь можно задавать ЛЮБЫЕ значения: 1, 2, 3, 4, 6, 8, 12 и т.д.
+        # Код ниже НЕ ограничен набором интервалов, он работает с любым float > 0.
+        self.default_interval_hours = {
+            "binance": 8.0,   # 3 раза в сутки
+            "bybit": 8.0,     # 3 раза в сутки
+            "mexc": 8.0,      # условно
+            "okx": 8.0,       # условно (если биржа отдаёт другой интервал — можно поменять)
+            "htx": 4.0,       # 6 раз в сутки
+            "lbank": 6.0,     # 4 раза в сутки
+            "bitget": 8.0,
+            "gate": 2.0,      # 12 раз в сутки
+            "bingx": 1.0,     # 24 раза в сутки
+        }
+
+    # ===== ВСПОМОГАТЕЛЬНАЯ ЛОГИКА ДЛЯ ИНТЕРВАЛОВ =====
+
+    def get_interval_hours(
+        self,
+        exchange: str,
+        raw: Optional[Dict] = None,
+    ) -> float:
+        """
+        Универсальное место, где определяется интервал выплат для конкретной записи.
+
+        Здесь можно:
+        - попытаться достать интервал из raw (если биржа его отдаёт),
+        - либо взять значение из self.default_interval_hours,
+        - либо поставить любой другой дефолт.
+
+        Никаких ограничений по возможным значениям нет – любое float > 0.
+        """
+        # Пример для будущего: если какая-то биржа отдаёт интервал в data:
+        # if exchange == "some_exchange" and raw is not None:
+        #     if "fundingInterval" in raw:
+        #         return float(raw["fundingInterval"])  # часов
+
+        # Если ничего умного не нашли — используем дефолт
+        interval = self.default_interval_hours.get(exchange, 8.0)
+
+        # Защита от ерунды
+        if interval <= 0:
+            interval = 8.0
+
+        return interval
+
+    def enrich_with_yield(
+        self,
+        exchange: str,
+        symbol: str,
+        funding_rate_percent: float,
+        interval_hours: float,
+    ) -> Dict:
+        """
+        На вход: биржа, символ, фандинг за ОДНУ выплату (%), интервал в часах.
+        На выход: словарь с полями, которые дальше использует бот.
+        """
+        payments_per_day = 24.0 / interval_hours
+        annual_yield = funding_rate_percent * payments_per_day * 365.0
+
+        return {
+            "exchange": exchange,
+            "symbol": symbol,
+            "funding_rate": funding_rate_percent,
+            "interval_hours": interval_hours,
+            "daily_payments": payments_per_day,
+            "annual_yield": annual_yield,
         }
 
     # ===== HTTP =====
@@ -79,11 +132,7 @@ class FundingRateBot:
             return []
 
     async def parse_exchange_data(self, exchange: str, data: dict) -> List[Dict]:
-        """Парсинг данных в единый формат:
-        {
-          exchange, symbol, funding_rate(%), interval_hours, daily_payments, annual_yield
-        }
-        """
+        """Парсинг данных в единый формат"""
         funding_data: List[Dict] = []
 
         try:
@@ -93,28 +142,20 @@ class FundingRateBot:
                 for item in data:
                     if "lastFundingRate" in item:
                         symbol = item.get("symbol", "")
-                        # Берём только USDT-пары
                         if not symbol.endswith("USDT"):
                             continue
+
                         fr_raw = item.get("lastFundingRate")
                         try:
                             funding_rate = float(fr_raw) * 100.0  # в процентах
                         except (TypeError, ValueError):
                             continue
 
-                        interval_hours = self.funding_intervals[exchange]
-                        daily_payments = 24 / interval_hours
-                        annual_yield = funding_rate * daily_payments * 365
-
+                        interval_hours = self.get_interval_hours(exchange, item)
                         funding_data.append(
-                            {
-                                "exchange": exchange,
-                                "symbol": symbol,
-                                "funding_rate": funding_rate,
-                                "interval_hours": interval_hours,
-                                "daily_payments": daily_payments,
-                                "annual_yield": annual_yield,
-                            }
+                            self.enrich_with_yield(
+                                exchange, symbol, funding_rate, interval_hours
+                            )
                         )
 
             # ---------- BYBIT ----------
@@ -126,7 +167,6 @@ class FundingRateBot:
                         if not symbol.endswith("USDT"):
                             continue
 
-                        # field fundingRate есть не всегда
                         fr_raw = item.get("fundingRate")
                         if fr_raw is None:
                             continue
@@ -135,19 +175,11 @@ class FundingRateBot:
                         except (TypeError, ValueError):
                             continue
 
-                        interval_hours = self.funding_intervals[exchange]
-                        daily_payments = 24 / interval_hours
-                        annual_yield = funding_rate * daily_payments * 365
-
+                        interval_hours = self.get_interval_hours(exchange, item)
                         funding_data.append(
-                            {
-                                "exchange": exchange,
-                                "symbol": symbol,
-                                "funding_rate": funding_rate,
-                                "interval_hours": interval_hours,
-                                "daily_payments": daily_payments,
-                                "annual_yield": annual_yield,
-                            }
+                            self.enrich_with_yield(
+                                exchange, symbol, funding_rate, interval_hours
+                            )
                         )
 
             # ---------- OKX ----------
@@ -198,21 +230,13 @@ class FundingRateBot:
                                 )
                                 continue
 
-                            interval_hours = self.funding_intervals["okx"]
-                            daily_payments = 24 / interval_hours
-                            annual_yield = funding_rate * daily_payments * 365
-
+                            interval_hours = self.get_interval_hours(exchange, inst)
                             symbol = inst_id.replace("-USDT-SWAP", "USDT")
 
                             funding_data.append(
-                                {
-                                    "exchange": "okx",
-                                    "symbol": symbol,
-                                    "funding_rate": funding_rate,
-                                    "interval_hours": interval_hours,
-                                    "daily_payments": daily_payments,
-                                    "annual_yield": annual_yield,
-                                }
+                                self.enrich_with_yield(
+                                    "okx", symbol, funding_rate, interval_hours
+                                )
                             )
 
                 except Exception as e:
@@ -280,7 +304,8 @@ class FundingRateBot:
             line = (
                 f"{item['exchange'].upper()} {item['symbol']}\n"
                 f"Фандинг: {funding_sign}{item['funding_rate']:.4f}%\n"
-                f"Выплат в сутки: {item['daily_payments']:.0f} раз (каждые {item['interval_hours']} ч)\n"
+                f"Выплат в сутки: {item['daily_payments']:.0f} раз "
+                f"(каждые {item['interval_hours']} ч)\n"
                 f"Годовая доходность: {item['annual_yield']:.2f}%\n"
                 f"{'-'*30}\n"
             )
