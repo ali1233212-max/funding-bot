@@ -1,78 +1,158 @@
 import requests
 from telegram.ext import ApplicationBuilder, CommandHandler
 
-# ---- Команда /start ----
-async def start(update, context):
-    await update.message.reply_text("Бот запущен! Команда: /funding")
 
+# ======================================================================
+#                          ОДИНОЧНЫЕ ФУНКЦИИ FUNDING
+# ======================================================================
 
-# ---- Функции получения funding ----
 def get_binance():
     try:
-        url = "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT"
+        url = "https://fapi.binance.com/fapi/v1/premiumIndex"
         data = requests.get(url).json()
-        return float(data["lastFundingRate"]) * 100
+        res = []
+        for i in data:
+            symbol = i["symbol"]
+            if symbol.endswith("USDT"):
+                res.append((symbol, float(i["lastFundingRate"]) * 100, "Binance"))
+        return res
     except:
-        return None
+        return []
+
 
 def get_bybit():
     try:
-        url = "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT"
+        url = "https://api.bybit.com/v5/market/tickers?category=linear"
         data = requests.get(url).json()
-        return float(data["result"]["list"][0]["fundingRate"]) * 100
+        res = []
+        for item in data["result"]["list"]:
+            symbol = item["symbol"]
+            if symbol.endswith("USDT"):
+                res.append((symbol, float(item["fundingRate"]) * 100, "Bybit"))
+        return res
     except:
-        return None
+        return []
+
 
 def get_okx():
     try:
-        url = "https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP"
-        data = requests.get(url).json()
-        return float(data["data"][0]["fundingRate"]) * 100
+        # Получаем все свопы
+        url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
+        pairs = requests.get(url).json()["data"]
+
+        res = []
+        for p in pairs:
+            inst = p["instId"]  # пример: BTC-USDT-SWAP
+            if inst.endswith("-USDT-SWAP"):
+                fr_url = f"https://www.okx.com/api/v5/public/funding-rate?instId={inst}"
+                d = requests.get(fr_url).json()
+                try:
+                    fr = float(d["data"][0]["fundingRate"]) * 100
+                    symbol = inst.replace("-USDT-SWAP", "USDT")
+                    res.append((symbol, fr, "OKX"))
+                except:
+                    pass
+        return res
     except:
-        return None
+        return []
+
 
 def get_deribit():
-    try:
-        url = "https://www.deribit.com/api/v2/public/get_funding_rate_value?instrument_name=BTC-PERPETUAL"
-        data = requests.get(url).json()
-        return float(data["result"]["funding_rate"]) * 100
-    except:
-        return None
+    res = []
+    for inst in ["BTC-PERPETUAL", "ETH-PERPETUAL"]:
+        try:
+            url = f"https://www.deribit.com/api/v2/public/get_funding_rate_value?instrument_name={inst}"
+            d = requests.get(url).json()
+            fr = float(d["result"]["funding_rate"]) * 100
+            symbol = inst.replace("-PERPETUAL", "USDT")
+            res.append((symbol, fr, "Deribit"))
+        except:
+            pass
+    return res
+
 
 def get_bitmex():
     try:
-        url = "https://www.bitmex.com/api/v1/instrument?symbol=XBTUSDT&columns=fundingRate"
+        url = "https://www.bitmex.com/api/v1/instrument?symbol=&columns=symbol,fundingRate"
         data = requests.get(url).json()
-        return float(data[0]["fundingRate"]) * 100
+        res = []
+        for item in data:
+            s = item["symbol"]
+            if "USDT" in s:
+                res.append((s, float(item["fundingRate"]) * 100, "BitMEX"))
+        return res
     except:
-        return None
+        return []
 
 
-# ---- Команда /funding ----
+# ======================================================================
+#                               КОМАНДА /funding (BTC)
+# ======================================================================
+
 async def funding(update, context):
-    binance = get_binance()
-    bybit = get_bybit()
-    okx = get_okx()
-    deribit = get_deribit()
-    bitmex = get_bitmex()
+    # BTCUSDT funding across exchanges
+    bb = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT").json()
+    binance_fr = float(bb["lastFundingRate"]) * 100
 
-    msg = "📊 *Funding Rate BTCUSDT*\n\n"
+    byb = requests.get("https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT").json()
+    bybit_fr = float(byb["result"]["list"][0]["fundingRate"]) * 100
 
-    msg += f"🟡 Binance:   {binance:.4f}%\n" if binance is not None else "🟡 Binance:   ❌ ошибка\n"
-    msg += f"🟣 Bybit:     {bybit:.4f}%\n" if bybit is not None else "🟣 Bybit:     ❌ ошибка\n"
-    msg += f"🔵 OKX:       {okx:.4f}%\n" if okx is not None else "🔵 OKX:       ❌ ошибка\n"
-    msg += f"🟠 Deribit:   {deribit:.4f}%\n" if deribit is not None else "🟠 Deribit:   ❌ ошибка\n"
-    msg += f"⚫ BitMEX:    {bitmex:.4f}%\n" if bitmex is not None else "⚫ BitMEX:    ❌ ошибка\n"
+    okx = requests.get("https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP").json()
+    okx_fr = float(okx["data"][0]["fundingRate"]) * 100
+
+    der = requests.get("https://www.deribit.com/api/v2/public/get_funding_rate_value?instrument_name=BTC-PERPETUAL").json()
+    der_fr = float(der["result"]["funding_rate"]) * 100
+
+    bitm = requests.get("https://www.bitmex.com/api/v1/instrument?symbol=XBTUSDT&columns=fundingRate").json()
+    bitmex_fr = float(bitm[0]["fundingRate"]) * 100
+
+    msg = f"""
+📊 *Funding Rate BTCUSDT*
+
+🟡 Binance:   {binance_fr:.4f}%
+🟣 Bybit:     {bybit_fr:.4f}%
+🔵 OKX:       {okx_fr:.4f}%
+🟠 Deribit:   {der_fr:.4f}%
+⚫ BitMEX:    {bitmex_fr:.4f}%
+"""
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+# ======================================================================
+#                        КОМАНДА /fundingall — ВСЕ ПАРЫ
+# ======================================================================
+
+async def funding_all(update, context):
+    await update.message.reply_text("⏳ Собираю данные со всех бирж...")
+
+    all_pairs = []
+    all_pairs.extend(get_binance())
+    all_pairs.extend(get_bybit())
+    all_pairs.extend(get_okx())
+    all_pairs.extend(get_deribit())
+    all_pairs.extend(get_bitmex())
+
+    # сортировка по funding: от максимального к минимальному
+    all_pairs.sort(key=lambda x: x[1], reverse=True)
+
+    msg = "📊 *Funding всех USDT-пар (ТОП-50)*\n\n"
+
+    for symbol, fr, exch in all_pairs[:50]:
+        msg += f"{symbol}: {fr:.4f}% ({exch})\n"
 
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-# ---- Запуск бота ----
+# ======================================================================
+#                               ЗАПУСК БОТА
+# ======================================================================
+
 BOT_TOKEN = "8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0"
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("funding", funding))
+app.add_handler(CommandHandler("fundingall", funding_all))
 
 app.run_polling()
