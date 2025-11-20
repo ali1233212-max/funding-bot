@@ -1,7 +1,6 @@
 import requests
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, CallbackContext
 
 # ======================================================================
 #                          ОДИНОЧНЫЕ ФУНКЦИИ FUNDING
@@ -42,7 +41,7 @@ def get_okx():
 
         res = []
         for p in pairs:
-            inst = p["instId"]
+            inst = p["instId"]  # example: BTC-USDT-SWAP
             if inst.endswith("-USDT-SWAP"):
                 fr_url = f"https://www.okx.com/api/v5/public/funding-rate?instId={inst}"
                 d = requests.get(fr_url).json()
@@ -86,42 +85,23 @@ def get_bitmex():
 
 
 # ======================================================================
-#                               КОМАНДА /funding (BTC)
+#                               КОМАНДЫ
 # ======================================================================
 
-async def funding(update, context):
-    bb = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT").json()
-    binance_fr = float(bb["lastFundingRate"]) * 100
-
-    byb = requests.get("https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT").json()
-    bybit_fr = float(byb["result"]["list"][0]["fundingRate"]) * 100
-
-    okx = requests.get("https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP").json()
-    okx_fr = float(okx["data"][0]["fundingRate"]) * 100
-
-    der = requests.get("https://www.deribit.com/api/v2/public/get_funding_rate_value?instrument_name=BTC-PERPETUAL").json()
-    der_fr = float(der["result"]["funding_rate"]) * 100
-
-    bitm = requests.get("https://www.bitmex.com/api/v1/instrument?symbol=XBTUSDT&columns=fundingRate").json()
-    bitmex_fr = float(bitm[0]["fundingRate"]) * 100
-
-    msg = f"""
-📊 *Funding Rate BTCUSDT*
-
-🟡 Binance:   {binance_fr:.4f}%
-🟣 Bybit:     {bybit_fr:.4f}%
-🔵 OKX:       {okx_fr:.4f}%
-🟠 Deribit:   {der_fr:.4f}%
-⚫ BitMEX:    {bitmex_fr:.4f}%
-"""
-    await update.message.reply_text(msg, parse_mode="Markdown")
+# Команда "/start"
+async def start(update: Update, context: CallbackContext):
+    msg = "Добро пожаловать в бот для отслеживания фандинга на криптобиржах! Выберите нужную команду:"
+    keyboard = [
+        [InlineKeyboardButton("Топ 5 фандингов (Положительные)", callback_data="top_positive_funding")],
+        [InlineKeyboardButton("Топ 5 фандингов (Отрицательные)", callback_data="top_negative_funding")],
+        [InlineKeyboardButton("Все пары с фандингом", callback_data="funding_all")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(msg, reply_markup=reply_markup)
 
 
-# ======================================================================
-#                        КОМАНДА /fundingall — ВСЕ ПАРЫ
-# ======================================================================
-
-async def funding_all(update, context):
+# Команда для получения фандинга для всех торговых пар
+async def funding_all(update: Update, context: CallbackContext):
     await update.message.reply_text("⏳ Собираю данные со всех бирж...")
 
     all_pairs = []
@@ -131,6 +111,7 @@ async def funding_all(update, context):
     all_pairs.extend(get_deribit())
     all_pairs.extend(get_bitmex())
 
+    # Сортировка по funding от максимального к минимальному
     all_pairs.sort(key=lambda x: x[1], reverse=True)
 
     msg = "📊 *Funding всех USDT-пар (ТОП-50)*\n\n"
@@ -141,87 +122,66 @@ async def funding_all(update, context):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
-# ======================================================================
-#                               КНОПКИ
-# ======================================================================
+# Команда для получения Топ-5 фандингов с положительным фандингом
+async def top_positive_funding(update: Update, context: CallbackContext):
+    await update.message.reply_text("⏳ Собираю данные по положительному фандингу...")
 
-async def button(update, context):
-    query = update.callback_query
-    await query.answer()  # Отвечаем на клик по кнопке, чтобы избежать тайм-аутов
+    all_pairs = []
+    all_pairs.extend(get_binance())
+    all_pairs.extend(get_bybit())
+    all_pairs.extend(get_okx())
+    all_pairs.extend(get_deribit())
+    all_pairs.extend(get_bitmex())
 
-    # Обрабатываем нажатие кнопок
-    if query.data == "all_pairs":
-        all_pairs = []
-        all_pairs.extend(get_binance())
-        all_pairs.extend(get_bybit())
-        all_pairs.extend(get_okx())
-        all_pairs.extend(get_deribit())
-        all_pairs.extend(get_bitmex())
+    # Сортировка по фандингу от максимального к минимальному
+    positive_pairs = [pair for pair in all_pairs if pair[1] > 0]
+    positive_pairs.sort(key=lambda x: x[1], reverse=True)
 
-        all_pairs.sort(key=lambda x: x[1], reverse=True)
+    msg = "📊 *Топ-5 положительных фандингов*:\n\n"
 
-        msg = "📊 *Funding всех USDT пар (ТОП-50)*\n\n"
-        for symbol, fr, exch in all_pairs[:50]:
-            msg += f"{symbol}: {fr:.4f}% ({exch})\n"
+    for symbol, fr, exch in positive_pairs[:5]:
+        msg += f"{symbol}: {fr:.4f}% ({exch})\n"
 
-        await query.edit_message_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
-    elif query.data == "negative":
-        negative_funding = [p for p in all_pairs if p[1] < 0]
-        negative_funding.sort(key=lambda x: x[1])
 
-        msg = "📊 *Отрицательные ставки*:\n\n"
-        for symbol, fr, exch in negative_funding:
-            msg += f"{symbol}: {fr:.4f}% ({exch})\n"
+# Команда для получения Топ-5 фандингов с отрицательным фандингом
+async def top_negative_funding(update: Update, context: CallbackContext):
+    await update.message.reply_text("⏳ Собираю данные по отрицательному фандингу...")
 
-        await query.edit_message_text(msg, parse_mode="Markdown")
+    all_pairs = []
+    all_pairs.extend(get_binance())
+    all_pairs.extend(get_bybit())
+    all_pairs.extend(get_okx())
+    all_pairs.extend(get_deribit())
+    all_pairs.extend(get_bitmex())
 
-    elif query.data == "positive":
-        positive_funding = [p for p in all_pairs if p[1] > 0]
-        positive_funding.sort(key=lambda x: x[1], reverse=True)
+    # Сортировка по фандингу от минимального к максимальному
+    negative_pairs = [pair for pair in all_pairs if pair[1] < 0]
+    negative_pairs.sort(key=lambda x: x[1])
 
-        msg = "📊 *Положительные ставки*:\n\n"
-        for symbol, fr, exch in positive_funding:
-            msg += f"{symbol}: {fr:.4f}% ({exch})\n"
+    msg = "📊 *Топ-5 отрицательных фандингов*:\n\n"
 
-        await query.edit_message_text(msg, parse_mode="Markdown")
+    for symbol, fr, exch in negative_pairs[:5]:
+        msg += f"{symbol}: {fr:.4f}% ({exch})\n"
 
-    elif query.data == "top_5":
-        top_negative = sorted(all_pairs, key=lambda x: x[1])[:5]
-        top_positive = sorted(all_pairs, key=lambda x: x[1], reverse=True)[:5]
-
-        msg = "📊 *ТОП-5 фандингов (отрицательные и положительные)*\n\n"
-        msg += "🔴 Отрицательные ставки:\n"
-        for symbol, fr, exch in top_negative:
-            msg += f"{symbol}: {fr:.4f}% ({exch})\n"
-
-        msg += "\n🟢 Положительные ставки:\n"
-        for symbol, fr, exch in top_positive:
-            msg += f"{symbol}: {fr:.4f}% ({exch})\n"
-
-        await query.edit_message_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 # ======================================================================
-#                               ЗАПУСК БОТА
+#                               ЗАПУСК БОТА С WEBHOOK
 # ======================================================================
 
-BOT_TOKEN = "8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0"  # Ваш токен
+BOT_TOKEN = "8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0"  # Замените на свой токен
 
+# Создание приложения
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-async def start(update, context):
-    keyboard = [
-        [InlineKeyboardButton("📊 Все USDT пары", callback_data="all_pairs"),
-         InlineKeyboardButton("🟥 Отрицательные ставки", callback_data="negative"),
-         InlineKeyboardButton("🟩 Положительные ставки", callback_data="positive")],
-        [InlineKeyboardButton("👑 ТОП-5 фандингов", callback_data="top_5")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Бот запущен! Выберите действие:", reply_markup=reply_markup)
-
-
+# Добавление обработчиков команд
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(button))
+app.add_handler(CommandHandler("funding_all", funding_all))
+app.add_handler(CommandHandler("top_positive_funding", top_positive_funding))
+app.add_handler(CommandHandler("top_negative_funding", top_negative_funding))
 
-app.run_polling()
+# Настройка webhook для Render (порт 8443)
+app.run_webhook(listen="0.0.0.0", port=8443, url_path="webhook")
