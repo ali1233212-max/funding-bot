@@ -69,11 +69,12 @@ async def funding(update, context):
 
 
 # ---- Запуск бота ----
-BOT_TOKEN = os.environ["BOT_TOKEN"]  # токен читаем из переменной окружения
+BOT_TOKEN = os.environ["8329955590:AAH63Ax6WmTjESyLVvqEPTE5ibutOiK_rCM"]
 
-app = ApplicationBuilder().token("8329955590:AAH63Ax6WmTjJESyLVvqEPTE5ibutOiK_rCM").build()
+app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("funding", funding))
 
 app.run_polling()
+
