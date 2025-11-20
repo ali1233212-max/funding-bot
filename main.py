@@ -1,4 +1,3 @@
-import os
 import requests
 from telegram.ext import ApplicationBuilder, CommandHandler
 
@@ -69,7 +68,7 @@ async def funding(update, context):
 
 
 # ---- Запуск бота ----
-BOT_TOKEN = os.environ["8329955590:AAH63Ax6WmTjESyLVvqEPTE5ibutOiK_rCM"]
+BOT_TOKEN = "8329955590:AAH63Ax6WmTjJESyLVvqEPTE5ibutOiK_rCM"
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -77,4 +76,3 @@ app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("funding", funding))
 
 app.run_polling()
-
