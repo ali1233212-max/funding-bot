@@ -2,7 +2,7 @@ import asyncio
 import aiohttp
 import logging
 from datetime import datetime
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -14,10 +14,8 @@ from telegram.ext import (
 
 # ================== НАСТРОЙКИ ==================
 
-# Твой токен бота
 BOT_TOKEN = "8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0"
 
-# Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -29,7 +27,6 @@ class FundingRateBot:
         # Эндпоинты бирж
         self.exchanges = {
             "binance": "https://fapi.binance.com/fapi/v1/premiumIndex",
-            # более корректный endpoint Bybit (v5, linear perp)
             "bybit": "https://api.bybit.com/v5/market/tickers?category=linear",
             "mexc": "https://contract.mexc.com/api/v1/contract/detail",
             # OKX: список SWAP-инструментов, funding будем запрашивать отдельно
@@ -42,20 +39,79 @@ class FundingRateBot:
             "bingx": "https://api.bingx.com/openApi/swap/v2/quote/fundingRate",
         }
 
-        # ДЕФОЛТНЫЕ интервалы выплат по биржам (в часах)
-        # ❗Здесь можно задавать ЛЮБЫЕ значения: 1, 2, 3, 4, 6, 8, 12 и т.д.
-        # Код ниже НЕ ограничен набором интервалов, он работает с любым float > 0.
+        # Дефолтные интервалы (если биржа не отдаёт свои), в часах
         self.default_interval_hours = {
-            "binance": 8.0,   # 3 раза в сутки
-            "bybit": 8.0,     # 3 раза в сутки
-            "mexc": 8.0,      # условно
-            "okx": 8.0,       # условно (если биржа отдаёт другой интервал — можно поменять)
-            "htx": 4.0,       # 6 раз в сутки
-            "lbank": 6.0,     # 4 раза в сутки
-            "bitget": 8.0,    # дефолт, если биржа не вернёт свой интервал
-            "gate": 2.0,      # 12 раз в сутки
-            "bingx": 1.0,     # 24 раза в сутки
+            "binance": 8.0,
+            "bybit": 8.0,
+            "mexc": 8.0,
+            "okx": 8.0,
+            "htx": 4.0,
+            "lbank": 6.0,
+            "bitget": 8.0,
+            "gate": 2.0,
+            "bingx": 1.0,
         }
+
+        # Кэш интервалов по символам: { "binance": {"BTCUSDT": 4.0, ...}, "bybit": {...}, ... }
+        self.symbol_intervals: Dict[str, Dict[str, float]] = {
+            "binance": {},
+            "bybit": {},
+            "okx": {},
+            "bitget": {},
+        }
+
+    # ===== ПРЕДЗАГРУЗКА РЕАЛЬНЫХ ИНТЕРВАЛОВ =====
+
+    async def preload_intervals(self):
+        """
+        Подгрузить реальные интервалы выплат для Binance и Bybit по всем символам.
+        Вызывается один раз перед основными запросами фандинга.
+        """
+        async with aiohttp.ClientSession() as session:
+            # Binance: /fapi/v1/fundingInfo — символы с изменёнными интервалами
+            try:
+                url_binance = "https://fapi.binance.com/fapi/v1/fundingInfo"
+                async with session.get(url_binance, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        # формат: [ { "symbol": "...", "fundingIntervalHours": 4, ... }, ... ]
+                        if isinstance(data, list):
+                            for item in data:
+                                sym = item.get("symbol")
+                                iv = item.get("fundingIntervalHours")
+                                try:
+                                    iv = float(iv)
+                                except (TypeError, ValueError):
+                                    continue
+                                if sym and iv and iv > 0:
+                                    self.symbol_intervals["binance"][sym] = iv
+                    else:
+                        logger.warning(f"Binance fundingInfo HTTP {resp.status}")
+            except Exception as e:
+                logger.error(f"Binance preload_intervals error: {e}")
+
+            # Bybit: /v5/market/instruments-info?category=linear
+            try:
+                url_bybit = "https://api.bybit.com/v5/market/instruments-info?category=linear"
+                async with session.get(url_bybit, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        # {"result": {"list": [ { "symbol": "...", "fundingInterval": "480", ... }, ...]}}
+                        if "result" in data and "list" in data["result"]:
+                            for item in data["result"]["list"]:
+                                sym = item.get("symbol")
+                                iv_min = item.get("fundingInterval")
+                                try:
+                                    iv_min = float(iv_min)
+                                except (TypeError, ValueError):
+                                    continue
+                                if sym and iv_min and iv_min > 0:
+                                    hours = iv_min / 60.0
+                                    self.symbol_intervals["bybit"][sym] = hours
+                    else:
+                        logger.warning(f"Bybit instruments-info HTTP {resp.status}")
+            except Exception as e:
+                logger.error(f"Bybit preload_intervals error: {e}")
 
     # ===== ВСПОМОГАТЕЛЬНАЯ ЛОГИКА ДЛЯ ИНТЕРВАЛОВ =====
 
@@ -65,18 +121,23 @@ class FundingRateBot:
         raw: Optional[Dict] = None,
     ) -> float:
         """
-        Универсальное место, где определяется интервал выплат для конкретной записи.
-
-        Здесь можно:
-        - попытаться достать интервал из raw (если биржа его отдаёт),
-        - либо взять значение из self.default_interval_hours,
-        - либо поставить любой другой дефолт.
-
-        Никаких ограничений по возможным значениям нет – любое float > 0.
+        1) Если есть индивидуальный интервал для конкретного символа – берём его.
+        2) Если биржа отдаёт интервал в raw (например Bitget) – читаем оттуда.
+        3) Иначе – дефолт из self.default_interval_hours.
         """
+        symbol = None
+        if raw is not None:
+            symbol = raw.get("symbol") or raw.get("instId") or raw.get("contract")
 
-        # Bitget: если в raw есть fundingRateInterval — используем его
-        # (битгет отдаёт его в часах, строкой, например "8" или "4")
+        # --- per-symbol кэш для Binance/Bybit/OKX/Bitget ---
+        if symbol:
+            ex_cache = self.symbol_intervals.get(exchange)
+            if ex_cache:
+                iv = ex_cache.get(symbol)
+                if iv is not None and iv > 0:
+                    return float(iv)
+
+        # --- Bitget: fundingRateInterval в часах ---
         if exchange == "bitget" and raw is not None:
             fri = raw.get("fundingRateInterval")
             if fri is not None:
@@ -87,18 +148,12 @@ class FundingRateBot:
                 except (TypeError, ValueError):
                     pass
 
-        # Пример для будущего: если какая-то биржа отдаёт интервал в data:
-        # if exchange == "some_exchange" and raw is not None:
-        #     if "fundingInterval" in raw:
-        #         return float(raw["fundingInterval"])  # часов
+        # TODO: сюда можно добавить логику для других бирж,
+        # если они отдают интервал внутри raw.
 
-        # Если ничего умного не нашли — используем дефолт
         interval = self.default_interval_hours.get(exchange, 8.0)
-
-        # Защита от ерунды
         if interval <= 0:
             interval = 8.0
-
         return interval
 
     def enrich_with_yield(
@@ -110,7 +165,7 @@ class FundingRateBot:
     ) -> Dict:
         """
         На вход: биржа, символ, фандинг за ОДНУ выплату (%), интервал в часах.
-        На выход: словарь с полями, которые дальше использует бот.
+        На выход: словарь, который дальше использует бот.
         """
         payments_per_day = 24.0 / interval_hours
         annual_yield = funding_rate_percent * payments_per_day * 365.0
@@ -152,7 +207,6 @@ class FundingRateBot:
         try:
             # ---------- BINANCE ----------
             if exchange == "binance":
-                # data – это список объектов
                 for item in data:
                     if "lastFundingRate" in item:
                         symbol = item.get("symbol", "")
@@ -161,7 +215,7 @@ class FundingRateBot:
 
                         fr_raw = item.get("lastFundingRate")
                         try:
-                            funding_rate = float(fr_raw) * 100.0  # в процентах
+                            funding_rate = float(fr_raw) * 100.0
                         except (TypeError, ValueError):
                             continue
 
@@ -174,7 +228,6 @@ class FundingRateBot:
 
             # ---------- BYBIT ----------
             elif exchange == "bybit":
-                # v5 /market/tickers -> data["result"]["list"]
                 if "result" in data and "list" in data["result"]:
                     for item in data["result"]["list"]:
                         symbol = item.get("symbol", "")
@@ -198,18 +251,15 @@ class FundingRateBot:
 
             # ---------- OKX ----------
             elif exchange == "okx":
-                # data — это ответ на /api/v5/public/instruments?instType=SWAP
                 instruments = data.get("data", [])
                 if not instruments:
                     logger.warning("OKX: пустой список инструментов")
                     return funding_data
 
                 try:
-                    # для каждого USDT-SWAP инструмента отдельно запрашиваем fundingRate
                     async with aiohttp.ClientSession() as session:
                         for inst in instruments:
                             inst_id = inst.get("instId", "")
-                            # Нас интересуют только USDT-свопы вида BTC-USDT-SWAP
                             if not inst_id.endswith("-USDT-SWAP"):
                                 continue
 
@@ -237,7 +287,7 @@ class FundingRateBot:
                                 fr_raw = fr_list[0].get("fundingRate")
                                 if fr_raw is None:
                                     continue
-                                funding_rate = float(fr_raw) * 100.0  # в процентах
+                                funding_rate = float(fr_raw) * 100.0
                             except Exception as e:
                                 logger.error(
                                     f"OKX парсинг fundingRate для {inst_id}: {e}"
@@ -258,21 +308,7 @@ class FundingRateBot:
 
             # ---------- BITGET ----------
             elif exchange == "bitget":
-                # data — это ответ на /api/v2/mix/market/current-fund-rate?productType=USDT-FUTURES
-                # Формат (упрощённый):
-                # {
-                #   "code": "00000",
-                #   "msg": "success",
-                #   "data": [
-                #     {
-                #       "symbol": "BTCUSDT",
-                #       "fundingRate": "0.000068",
-                #       "fundingRateInterval": "8",
-                #       ...
-                #     }, ...
-                #   ]
-                # }
-
+                # data — ответ на /api/v2/mix/market/current-fund-rate?productType=USDT-FUTURES
                 if data.get("code") != "00000":
                     logger.warning(f"Bitget: code != 00000: {data.get('code')}")
                     return funding_data
@@ -292,13 +328,11 @@ class FundingRateBot:
                         continue
 
                     try:
-                        # fundingRate в долях → умножаем на 100, чтобы получить %
-                        funding_rate = float(fr_raw) * 100.0
+                        funding_rate = float(fr_raw) * 100.0  # доля → %
                     except (TypeError, ValueError):
                         continue
 
                     interval_hours = self.get_interval_hours(exchange, item)
-
                     funding_data.append(
                         self.enrich_with_yield(
                             "bitget", symbol, funding_rate, interval_hours
@@ -313,7 +347,6 @@ class FundingRateBot:
                 "gate",
                 "bingx",
             ]:
-                # Здесь можно позже дописать реальные парсеры
                 logger.info(f"Парсер для {exchange} пока не реализован")
 
         except Exception as e:
@@ -325,6 +358,13 @@ class FundingRateBot:
 
     async def get_all_funding_rates(self) -> List[Dict]:
         """Собираем funding rates со всех бирж"""
+
+        # 1. сначала подтянем реальные интервалы выплат где возможно
+        try:
+            await self.preload_intervals()
+        except Exception as e:
+            logger.error(f"preload_intervals error: {e}")
+
         all_data: List[Dict] = []
 
         async with aiohttp.ClientSession() as session:
@@ -343,10 +383,8 @@ class FundingRateBot:
     def sort_funding_rates(self, data: List[Dict], sort_type: str = "negative") -> List[Dict]:
         """Сортировка funding rates"""
         if sort_type == "negative":
-            # сначала самые отрицательные
             return sorted(data, key=lambda x: x["funding_rate"])
         elif sort_type == "positive":
-            # сначала самые большие положительные
             return sorted(data, key=lambda x: x["funding_rate"], reverse=True)
         return data
 
@@ -372,8 +410,7 @@ class FundingRateBot:
                 f"{'-'*30}\n"
             )
 
-            # если добавление строки превысит лимит — отправляем текущий блок и начинаем новый
-            if len(current) + len(line) > 3500:  # немного с запасом меньше 4096
+            if len(current) + len(line) > 3500:
                 chunks.append(current)
                 current = line
             else:
@@ -397,15 +434,14 @@ class FundingRateBot:
             if len(rates) < 2:
                 continue
 
-            # сортируем по funding_rate
             rates_sorted = sorted(rates, key=lambda x: x["funding_rate"])
-            lowest = rates_sorted[0]   # здесь фандинг минимальный
-            highest = rates_sorted[-1] # здесь максимум
+            lowest = rates_sorted[0]
+            highest = rates_sorted[-1]
 
             diff = highest["funding_rate"] - lowest["funding_rate"]
             potential_yield = abs(lowest["annual_yield"]) + abs(highest["annual_yield"])
 
-            if diff > 0.01:  # фильтр по минимальной разнице
+            if diff > 0.01:
                 opportunities.append(
                     {
                         "symbol": symbol,
@@ -527,9 +563,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    """Точка входа"""
     application = Application.builder().token(BOT_TOKEN).build()
-
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
