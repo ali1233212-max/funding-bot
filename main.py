@@ -2,46 +2,69 @@ import asyncio
 import aiohttp
 import logging
 from datetime import datetime
+from typing import List, Dict
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from typing import List, Dict, Tuple
-import json
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-# Настройка логирования
+# ================== НАСТРОЙКИ ==================
+
+# Твой токен бота
+BOT_TOKEN = "8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0"
+
+# Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+# ================== КЛАСС БОТА ==================
+
 class FundingRateBot:
     def __init__(self):
+        # Эндпоинты бирж
         self.exchanges = {
-            'binance': 'https://fapi.binance.com/fapi/v1/premiumIndex',
-            'bybit': 'https://api.bybit.com/v2/public/tickers',
-            'mexc': 'https://contract.mexc.com/api/v1/contract/detail',
-            'okx': 'https://www.okx.com/api/v5/public/funding-rate',
-            'htx': 'https://api.hbdm.com/swap-api/v1/swap_contract_info',
-            'lbank': 'https://api.lbank.info/v2/futures/fundingRate.do',
-            'bitget': 'https://api.bitget.com/api/mix/v1/market/contracts',
-            'gate': 'https://api.gateio.ws/api/v4/futures/usdt/contracts',
-            'bingx': 'https://api.bingx.com/openApi/swap/v2/quote/fundingRate'
-        }
-        
-        # Периодичности выплат для разных бирж (в часах)
-        self.funding_intervals = {
-            'binance': 8,      # 3 раза в сутки
-            'bybit': 8,        # 3 раза в сутки  
-            'mexc': 8,         # 3 раза в сутки
-            'okx': 8,          # 3 раза в сутки
-            'htx': 8,          # 3 раза в сутки
-            'lbank': 8,        # 3 раза в сутки
-            'bitget': 8,       # 3 раза в сутки
-            'gate': 8,         # 3 раза в сутки
-            'bingx': 8         # 3 раза в сутки
+            "binance": "https://fapi.binance.com/fapi/v1/premiumIndex",
+            # более корректный endpoint Bybit (v5, linear perp)
+            "bybit": "https://api.bybit.com/v5/market/tickers?category=linear",
+            "mexc": "https://contract.mexc.com/api/v1/contract/detail",
+            "okx": "https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP",
+            "htx": "https://api.hbdm.com/swap-api/v1/swap_contract_info",
+            "lbank": "https://api.lbank.info/v2/futures/fundingRate.do",
+            "bitget": "https://api.bitget.com/api/mix/v1/market/contracts",
+            "gate": "https://api.gateio.ws/api/v4/futures/usdt/contracts",
+            "bingx": "https://api.bingx.com/openApi/swap/v2/quote/fundingRate",
         }
 
-    async def fetch_exchange_data(self, session: aiohttp.ClientSession, exchange: str, url: str) -> List[Dict]:
-        """Получение данных с биржи"""
+        # Периодичность выплат (часов между выплатами)
+        # (пока задаём константой, при желании потом можно тянуть из API)
+        self.funding_intervals = {
+            "binance": 8,
+            "bybit": 8,
+            "mexc": 8,
+            "okx": 8,
+            "htx": 8,
+            "lbank": 8,
+            "bitget": 8,
+            "gate": 8,
+            "bingx": 8,
+        }
+
+    # ===== HTTP =====
+
+    async def fetch_exchange_data(
+        self,
+        session: aiohttp.ClientSession,
+        exchange: str,
+        url: str,
+    ) -> List[Dict]:
+        """Получение сырых данных с биржи и парсинг в единый формат"""
         try:
-            async with session.get(url, timeout=10) as response:
+            async with session.get(url, timeout=15) as response:
                 if response.status == 200:
                     data = await response.json()
                     return await self.parse_exchange_data(exchange, data)
@@ -53,144 +76,200 @@ class FundingRateBot:
             return []
 
     async def parse_exchange_data(self, exchange: str, data: dict) -> List[Dict]:
-        """Парсинг данных в зависимости от биржи"""
-        funding_data = []
-        
+        """Парсинг данных в единый формат:
+        {
+          exchange, symbol, funding_rate(%), interval_hours, daily_payments, annual_yield
+        }
+        """
+        funding_data: List[Dict] = []
+
         try:
-            if exchange == 'binance':
+            # ---------- BINANCE ----------
+            if exchange == "binance":
+                # data – это список объектов
                 for item in data:
-                    if 'lastFundingRate' in item:
-                        symbol = item['symbol']
-                        funding_rate = float(item['lastFundingRate']) * 100  # в процентах
+                    if "lastFundingRate" in item:
+                        symbol = item.get("symbol", "")
+                        # Берём только USDT-пары
+                        if not symbol.endswith("USDT"):
+                            continue
+                        fr_raw = item.get("lastFundingRate")
+                        try:
+                            funding_rate = float(fr_raw) * 100.0  # в процентах
+                        except (TypeError, ValueError):
+                            continue
+
                         interval_hours = self.funding_intervals[exchange]
                         daily_payments = 24 / interval_hours
                         annual_yield = funding_rate * daily_payments * 365
-                        
-                        funding_data.append({
-                            'exchange': exchange,
-                            'symbol': symbol,
-                            'funding_rate': funding_rate,
-                            'interval_hours': interval_hours,
-                            'daily_payments': daily_payments,
-                            'annual_yield': annual_yield
-                        })
-                        
-            elif exchange == 'bybit':
-                if 'result' in data:
-                    for item in data['result']:
-                        if 'funding_rate' in item:
-                            symbol = item['symbol']
-                            funding_rate = float(item['funding_rate']) * 100
-                            interval_hours = self.funding_intervals[exchange]
-                            daily_payments = 24 / interval_hours
-                            annual_yield = funding_rate * daily_payments * 365
-                            
-                            funding_data.append({
-                                'exchange': exchange,
-                                'symbol': symbol,
-                                'funding_rate': funding_rate,
-                                'interval_hours': interval_hours,
-                                'daily_payments': daily_payments,
-                                'annual_yield': annual_yield
-                            })
-            
-            # Аналогичные парсеры для других бирж...
-            # Для демонстрации добавим заглушки
-            elif exchange in ['mexc', 'okx', 'htx', 'lbank', 'bitget', 'gate', 'bingx']:
-                # В реальной реализации здесь будут конкретные парсеры для каждой биржи
-                logger.info(f"Парсер для {exchange} требует реализации")
-                
+
+                        funding_data.append(
+                            {
+                                "exchange": exchange,
+                                "symbol": symbol,
+                                "funding_rate": funding_rate,
+                                "interval_hours": interval_hours,
+                                "daily_payments": daily_payments,
+                                "annual_yield": annual_yield,
+                            }
+                        )
+
+            # ---------- BYBIT ----------
+            elif exchange == "bybit":
+                # v5 /market/tickers -> data["result"]["list"]
+                if "result" in data and "list" in data["result"]:
+                    for item in data["result"]["list"]:
+                        symbol = item.get("symbol", "")
+                        if not symbol.endswith("USDT"):
+                            continue
+
+                        # field fundingRate есть не всегда
+                        fr_raw = item.get("fundingRate")
+                        if fr_raw is None:
+                            continue
+                        try:
+                            funding_rate = float(fr_raw) * 100.0
+                        except (TypeError, ValueError):
+                            continue
+
+                        interval_hours = self.funding_intervals[exchange]
+                        daily_payments = 24 / interval_hours
+                        annual_yield = funding_rate * daily_payments * 365
+
+                        funding_data.append(
+                            {
+                                "exchange": exchange,
+                                "symbol": symbol,
+                                "funding_rate": funding_rate,
+                                "interval_hours": interval_hours,
+                                "daily_payments": daily_payments,
+                                "annual_yield": annual_yield,
+                            }
+                        )
+
+            # ---------- ЗАГЛУШКИ ДЛЯ ОСТАЛЬНЫХ ----------
+            elif exchange in [
+                "mexc",
+                "okx",
+                "htx",
+                "lbank",
+                "bitget",
+                "gate",
+                "bingx",
+            ]:
+                # Здесь можно позже дописать реальные парсеры
+                logger.info(f"Парсер для {exchange} пока не реализован")
+
         except Exception as e:
             logger.error(f"Ошибка парсинга {exchange}: {e}")
-            
+
         return funding_data
 
+    # ===== ОБЩИЕ ОПЕРАЦИИ =====
+
     async def get_all_funding_rates(self) -> List[Dict]:
-        """Получение всех funding rates со всех бирж"""
-        all_data = []
-        
+        """Собираем funding rates со всех бирж"""
+        all_data: List[Dict] = []
+
         async with aiohttp.ClientSession() as session:
-            tasks = []
-            for exchange, url in self.exchanges.items():
-                task = self.fetch_exchange_data(session, exchange, url)
-                tasks.append(task)
-            
-            results = await asyncio.gather(*tasks)
-            for result in results:
-                all_data.extend(result)
-                
+            tasks = [
+                self.fetch_exchange_data(session, exch, url)
+                for exch, url in self.exchanges.items()
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for res in results:
+                if isinstance(res, list):
+                    all_data.extend(res)
+
         return all_data
 
-    def sort_funding_rates(self, data: List[Dict], sort_type: str = 'negative') -> List[Dict]:
+    def sort_funding_rates(self, data: List[Dict], sort_type: str = "negative") -> List[Dict]:
         """Сортировка funding rates"""
-        if sort_type == 'negative':
-            return sorted(data, key=lambda x: x['funding_rate'])
-        elif sort_type == 'positive':
-            return sorted(data, key=lambda x: x['funding_rate'], reverse=True)
-        else:
-            return data
+        if sort_type == "negative":
+            # сначала самые отрицательные
+            return sorted(data, key=lambda x: x["funding_rate"])
+        elif sort_type == "positive":
+            # сначала самые большие положительные
+            return sorted(data, key=lambda x: x["funding_rate"], reverse=True)
+        return data
 
-    def format_funding_message(self, data: List[Dict], limit: int = None) -> str:
-        """Форматирование сообщения с funding rates"""
+    def format_funding_message(self, data: List[Dict], limit: int | None = None) -> List[str]:
+        """Формируем одно или несколько сообщений (с учётом лимита 4096 символов Telegram)"""
         if not data:
-            return "Данные не найдены"
-            
-        if limit:
+            return ["Данные не найдены"]
+
+        if limit is not None:
             data = data[:limit]
-            
-        message = ""
+
+        chunks: List[str] = []
+        current = ""
+
         for item in data:
-            funding_sign = "+" if item['funding_rate'] > 0 else ""
-            message += (
+            funding_sign = "+" if item["funding_rate"] > 0 else ""
+            line = (
                 f"{item['exchange'].upper()} {item['symbol']}\n"
                 f"Фандинг: {funding_sign}{item['funding_rate']:.4f}%\n"
-                f"Выплат в сутки: {item['daily_payments']:.0f} раз\n"
+                f"Выплат в сутки: {item['daily_payments']:.0f} раз (каждые {item['interval_hours']} ч)\n"
                 f"Годовая доходность: {item['annual_yield']:.2f}%\n"
                 f"{'-'*30}\n"
             )
-            
-        return message
 
-    async def get_arbitrage_opportunities(self, data: List[Dict]) -> str:
-        """Поиск арбитражных возможностей"""
-        # Группируем по символам
-        symbol_groups = {}
+            # если добавление строки превысит лимит — отправляем текущий блок и начинаем новый
+            if len(current) + len(line) > 3500:  # немного с запасом меньше 4096
+                chunks.append(current)
+                current = line
+            else:
+                current += line
+
+        if current:
+            chunks.append(current)
+
+        return chunks
+
+    async def get_arbitrage_opportunities(self, data: List[Dict]) -> List[str]:
+        """Поиск арбитражных возможностей между биржами по одной и той же паре"""
+        symbol_groups: Dict[str, List[Dict]] = {}
         for item in data:
-            symbol = item['symbol']
-            if symbol not in symbol_groups:
-                symbol_groups[symbol] = []
-            symbol_groups[symbol].append(item)
-        
+            symbol = item["symbol"]
+            symbol_groups.setdefault(symbol, []).append(item)
+
         opportunities = []
-        
+
         for symbol, rates in symbol_groups.items():
-            if len(rates) >= 2:
-                # Ищем максимальную разницу в funding rates
-                rates.sort(key=lambda x: x['funding_rate'])
-                lowest = rates[0]   # Для лонга (мы получаем выплаты)
-                highest = rates[-1] # Для шорта (мы платим выплаты)
-                
-                diff = highest['funding_rate'] - lowest['funding_rate']
-                potential_yield = abs(lowest['annual_yield']) + abs(highest['annual_yield'])
-                
-                if diff > 0.01:  # Минимальная разница
-                    opportunities.append({
-                        'symbol': symbol,
-                        'long_exchange': lowest['exchange'],
-                        'short_exchange': highest['exchange'],
-                        'funding_diff': diff,
-                        'potential_yield': potential_yield
-                    })
-        
-        # Сортируем по потенциальной доходности
-        opportunities.sort(key=lambda x: x['potential_yield'], reverse=True)
-        
+            if len(rates) < 2:
+                continue
+
+            # сортируем по funding_rate
+            rates_sorted = sorted(rates, key=lambda x: x["funding_rate"])
+            lowest = rates_sorted[0]   # здесь фандинг минимальный
+            highest = rates_sorted[-1] # здесь максимум
+
+            diff = highest["funding_rate"] - lowest["funding_rate"]
+            potential_yield = abs(lowest["annual_yield"]) + abs(highest["annual_yield"])
+
+            if diff > 0.01:  # фильтр по минимальной разнице
+                opportunities.append(
+                    {
+                        "symbol": symbol,
+                        "long_exchange": lowest["exchange"],
+                        "short_exchange": highest["exchange"],
+                        "funding_diff": diff,
+                        "potential_yield": potential_yield,
+                    }
+                )
+
+        opportunities.sort(key=lambda x: x["potential_yield"], reverse=True)
+
         if not opportunities:
-            return "Арбитражные возможности не найдены"
-            
-        message = "🔀 Арбитражные возможности:\n\n"
-        for opp in opportunities[:10]:  # Топ 10
-            message += (
+            return ["Арбитражные возможности не найдены"]
+
+        msg = "🔀 Арбитражные возможности (топ 10):\n\n"
+        chunks = []
+        current = msg
+
+        for opp in opportunities[:10]:
+            line = (
                 f"Пара: {opp['symbol']}\n"
                 f"🔺 ЛОНГ на {opp['long_exchange'].upper()}\n"
                 f"🔻 ШОРТ на {opp['short_exchange'].upper()}\n"
@@ -198,91 +277,108 @@ class FundingRateBot:
                 f"Потенциальная доходность: {opp['potential_yield']:.2f}%\n"
                 f"{'-'*30}\n"
             )
-            
-        return message
+            if len(current) + len(line) > 3500:
+                chunks.append(current)
+                current = line
+            else:
+                current += line
 
-# Создаем экземпляр бота
+        if current:
+            chunks.append(current)
+
+        return chunks
+
+
+# ================== ЭКЗЕМПЛЯР БОТА ==================
+
 bot = FundingRateBot()
 
+
+# ================== TELEGRAM-HANDLERS ==================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда старт с кнопками"""
+    """Команда /start с кнопками"""
     keyboard = [
         ["📊 Все фандинги (отрицательные)", "📈 Все фандинги (положительные)"],
         ["🏆 Топ 5 лучших фандингов", "🔀 Связки арбитража"],
-        ["🔄 Обновить данные"]
+        ["🔄 Обновить данные"],
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    
+
     await update.message.reply_text(
         "🤖 Бот мониторинга Funding Rates\n\n"
         "Выберите действие:",
-        reply_markup=reply_markup
+        reply_markup=reply_markup,
     )
 
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик текстовых сообщений"""
-    message_text = update.message.text
-    
+    """Обработчик текстовых сообщений (кнопки)"""
+    message_text = update.message.text.strip()
+
     try:
         if message_text == "📊 Все фандинги (отрицательные)":
             await update.message.reply_text("⏳ Загружаю данные...")
             data = await bot.get_all_funding_rates()
-            sorted_data = bot.sort_funding_rates(data, 'negative')
-            message = bot.format_funding_message(sorted_data, 50)  # Ограничиваем вывод
-            await update.message.reply_text(message)
-            
+            sorted_data = bot.sort_funding_rates(data, "negative")
+            chunks = bot.format_funding_message(sorted_data, limit=50)
+            for chunk in chunks:
+                await update.message.reply_text(chunk)
+
         elif message_text == "📈 Все фандинги (положительные)":
             await update.message.reply_text("⏳ Загружаю данные...")
             data = await bot.get_all_funding_rates()
-            sorted_data = bot.sort_funding_rates(data, 'positive')
-            message = bot.format_funding_message(sorted_data, 50)
-            await update.message.reply_text(message)
-            
+            sorted_data = bot.sort_funding_rates(data, "positive")
+            chunks = bot.format_funding_message(sorted_data, limit=50)
+            for chunk in chunks:
+                await update.message.reply_text(chunk)
+
         elif message_text == "🏆 Топ 5 лучших фандингов":
             await update.message.reply_text("⏳ Загружаю данные...")
             data = await bot.get_all_funding_rates()
-            
-            # Топ отрицательных
-            negative_data = [d for d in data if d['funding_rate'] < 0]
-            top_negative = bot.sort_funding_rates(negative_data, 'negative')[:5]
-            
-            # Топ положительных  
-            positive_data = [d for d in data if d['funding_rate'] > 0]
-            top_positive = bot.sort_funding_rates(positive_data, 'positive')[:5]
-            
-            message = "🔻 Топ 5 отрицательных фандингов:\n\n"
-            message += bot.format_funding_message(top_negative)
-            
-            message += "\n🔺 Топ 5 положительных фандингов:\n\n"
-            message += bot.format_funding_message(top_positive)
-            
-            await update.message.reply_text(message)
-            
+
+            negative_data = [d for d in data if d["funding_rate"] < 0]
+            top_negative = bot.sort_funding_rates(negative_data, "negative")[:5]
+
+            positive_data = [d for d in data if d["funding_rate"] > 0]
+            top_positive = bot.sort_funding_rates(positive_data, "positive")[:5]
+
+            msg_neg_chunks = bot.format_funding_message(top_negative)
+            msg_pos_chunks = bot.format_funding_message(top_positive)
+
+            await update.message.reply_text("🔻 Топ 5 отрицательных фандингов:\n")
+            for chunk in msg_neg_chunks:
+                await update.message.reply_text(chunk)
+
+            await update.message.reply_text("🔺 Топ 5 положительных фандингов:\n")
+            for chunk in msg_pos_chunks:
+                await update.message.reply_text(chunk)
+
         elif message_text == "🔀 Связки арбитража":
             await update.message.reply_text("⏳ Ищу арбитражные возможности...")
             data = await bot.get_all_funding_rates()
-            message = await bot.get_arbitrage_opportunities(data)
-            await update.message.reply_text(message)
-            
+            chunks = await bot.get_arbitrage_opportunities(data)
+            for chunk in chunks:
+                await update.message.reply_text(chunk)
+
         elif message_text == "🔄 Обновить данные":
-            await update.message.reply_text("✅ Данные обновляются при каждом запросе!")
-            
+            await update.message.reply_text("✅ Данные всегда обновляются при каждом запросе!")
+
     except Exception as e:
         logger.error(f"Ошибка: {e}")
         await update.message.reply_text("❌ Произошла ошибка при получении данных")
 
+
 def main():
-    """Основная функция"""
-    # Ваш токен уже вставлен здесь
-    application = Application.builder().token("8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0").build()
-    
-    # Добавляем обработчики
+    """Точка входа"""
+    application = Application.builder().token(BOT_TOKEN).build()
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # Запускаем бота
-    print("Бот запущен...")
+
+    print("Бот запущен (polling)...")
     application.run_polling()
+
 
 if __name__ == "__main__":
     main()
