@@ -3,6 +3,18 @@ from telegram.ext import ApplicationBuilder, CommandHandler
 
 
 # ======================================================================
+#                               КОМАНДА /start
+# ======================================================================
+
+async def start(update, context):
+    await update.message.reply_text(
+        "Бот запущен! Доступные команды:\n"
+        "/funding — funding BTCUSDT по биржам\n"
+        "/fundingall — funding всех USDT-пар\n"
+    )
+
+
+# ======================================================================
 #                          ОДИНОЧНЫЕ ФУНКЦИИ FUNDING
 # ======================================================================
 
@@ -36,13 +48,12 @@ def get_bybit():
 
 def get_okx():
     try:
-        # Получаем все свопы
         url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
         pairs = requests.get(url).json()["data"]
 
         res = []
         for p in pairs:
-            inst = p["instId"]  # пример: BTC-USDT-SWAP
+            inst = p["instId"]
             if inst.endswith("-USDT-SWAP"):
                 fr_url = f"https://www.okx.com/api/v5/public/funding-rate?instId={inst}"
                 d = requests.get(fr_url).json()
@@ -86,11 +97,10 @@ def get_bitmex():
 
 
 # ======================================================================
-#                               КОМАНДА /funding (BTC)
+#                               КОМАНДА /funding
 # ======================================================================
 
 async def funding(update, context):
-    # BTCUSDT funding across exchanges
     bb = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT").json()
     binance_fr = float(bb["lastFundingRate"]) * 100
 
@@ -132,7 +142,6 @@ async def funding_all(update, context):
     all_pairs.extend(get_deribit())
     all_pairs.extend(get_bitmex())
 
-    # сортировка по funding: от максимального к минимальному
     all_pairs.sort(key=lambda x: x[1], reverse=True)
 
     msg = "📊 *Funding всех USDT-пар (ТОП-50)*\n\n"
