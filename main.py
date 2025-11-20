@@ -36,7 +36,8 @@ class FundingRateBot:
             "okx": "https://www.okx.com/api/v5/public/instruments?instType=SWAP",
             "htx": "https://api.hbdm.com/swap-api/v1/swap_contract_info",
             "lbank": "https://api.lbank.info/v2/futures/fundingRate.do",
-            "bitget": "https://api.bitget.com/api/mix/v1/market/contracts",
+            # Bitget: текущий фандинг по всем USDT-FUTURES
+            "bitget": "https://api.bitget.com/api/v2/mix/market/current-fund-rate?productType=USDT-FUTURES",
             "gate": "https://api.gateio.ws/api/v4/futures/usdt/contracts",
             "bingx": "https://api.bingx.com/openApi/swap/v2/quote/fundingRate",
         }
@@ -51,7 +52,7 @@ class FundingRateBot:
             "okx": 8.0,       # условно (если биржа отдаёт другой интервал — можно поменять)
             "htx": 4.0,       # 6 раз в сутки
             "lbank": 6.0,     # 4 раза в сутки
-            "bitget": 8.0,
+            "bitget": 8.0,    # дефолт, если биржа не вернёт свой интервал
             "gate": 2.0,      # 12 раз в сутки
             "bingx": 1.0,     # 24 раза в сутки
         }
@@ -73,6 +74,19 @@ class FundingRateBot:
 
         Никаких ограничений по возможным значениям нет – любое float > 0.
         """
+
+        # Bitget: если в raw есть fundingRateInterval — используем его
+        # (битгет отдаёт его в часах, строкой, например "8" или "4")
+        if exchange == "bitget" and raw is not None:
+            fri = raw.get("fundingRateInterval")
+            if fri is not None:
+                try:
+                    interval = float(fri)
+                    if interval > 0:
+                        return interval
+                except (TypeError, ValueError):
+                    pass
+
         # Пример для будущего: если какая-то биржа отдаёт интервал в data:
         # if exchange == "some_exchange" and raw is not None:
         #     if "fundingInterval" in raw:
@@ -242,12 +256,60 @@ class FundingRateBot:
                 except Exception as e:
                     logger.error(f"Ошибка общего парсинга OKX: {e}")
 
+            # ---------- BITGET ----------
+            elif exchange == "bitget":
+                # data — это ответ на /api/v2/mix/market/current-fund-rate?productType=USDT-FUTURES
+                # Формат (упрощённый):
+                # {
+                #   "code": "00000",
+                #   "msg": "success",
+                #   "data": [
+                #     {
+                #       "symbol": "BTCUSDT",
+                #       "fundingRate": "0.000068",
+                #       "fundingRateInterval": "8",
+                #       ...
+                #     }, ...
+                #   ]
+                # }
+
+                if data.get("code") != "00000":
+                    logger.warning(f"Bitget: code != 00000: {data.get('code')}")
+                    return funding_data
+
+                items = data.get("data", [])
+                if not isinstance(items, list):
+                    logger.warning("Bitget: неожиданный формат data")
+                    return funding_data
+
+                for item in items:
+                    symbol = item.get("symbol", "")
+                    if not symbol.endswith("USDT"):
+                        continue
+
+                    fr_raw = item.get("fundingRate")
+                    if fr_raw is None:
+                        continue
+
+                    try:
+                        # fundingRate в долях → умножаем на 100, чтобы получить %
+                        funding_rate = float(fr_raw) * 100.0
+                    except (TypeError, ValueError):
+                        continue
+
+                    interval_hours = self.get_interval_hours(exchange, item)
+
+                    funding_data.append(
+                        self.enrich_with_yield(
+                            "bitget", symbol, funding_rate, interval_hours
+                        )
+                    )
+
             # ---------- ЗАГЛУШКИ ДЛЯ ОСТАЛЬНЫХ ----------
             elif exchange in [
                 "mexc",
                 "htx",
                 "lbank",
-                "bitget",
                 "gate",
                 "bingx",
             ]:
