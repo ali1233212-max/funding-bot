@@ -1,5 +1,6 @@
 import requests
-from telegram.ext import ApplicationBuilder, CommandHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 # ======================================================================
@@ -7,10 +8,16 @@ from telegram.ext import ApplicationBuilder, CommandHandler
 # ======================================================================
 
 async def start(update, context):
+    keyboard = [
+        [InlineKeyboardButton("📊 Все USDT пары", callback_data="all_pairs"),
+         InlineKeyboardButton("🟥 Отрицательные ставки", callback_data="negative"),
+         InlineKeyboardButton("🟩 Положительные ставки", callback_data="positive")],
+        [InlineKeyboardButton("👑 ТОП-5 фандингов", callback_data="top_5")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "Бот запущен! Доступные команды:\n"
-        "/funding — funding BTCUSDT по биржам\n"
-        "/fundingall — funding всех USDT-пар\n"
+        "Бот запущен! Выберите действие:",
+        reply_markup=reply_markup
     )
 
 
@@ -26,7 +33,7 @@ def get_binance():
         for i in data:
             symbol = i["symbol"]
             if symbol.endswith("USDT"):
-                res.append((symbol, float(i["lastFundingRate"]) * 100, "Binance"))
+                res.append((symbol, float(i["lastFundingRate"]) * 100, "Binance", "8h"))
         return res
     except:
         return []
@@ -40,7 +47,7 @@ def get_bybit():
         for item in data["result"]["list"]:
             symbol = item["symbol"]
             if symbol.endswith("USDT"):
-                res.append((symbol, float(item["fundingRate"]) * 100, "Bybit"))
+                res.append((symbol, float(item["fundingRate"]) * 100, "Bybit", "8h"))
         return res
     except:
         return []
@@ -50,7 +57,6 @@ def get_okx():
     try:
         url = "https://www.okx.com/api/v5/public/instruments?instType=SWAP"
         pairs = requests.get(url).json()["data"]
-
         res = []
         for p in pairs:
             inst = p["instId"]
@@ -60,7 +66,7 @@ def get_okx():
                 try:
                     fr = float(d["data"][0]["fundingRate"]) * 100
                     symbol = inst.replace("-USDT-SWAP", "USDT")
-                    res.append((symbol, fr, "OKX"))
+                    res.append((symbol, fr, "OKX", "8h"))
                 except:
                     pass
         return res
@@ -76,7 +82,7 @@ def get_deribit():
             d = requests.get(url).json()
             fr = float(d["result"]["funding_rate"]) * 100
             symbol = inst.replace("-PERPETUAL", "USDT")
-            res.append((symbol, fr, "Deribit"))
+            res.append((symbol, fr, "Deribit", "1h"))
         except:
             pass
     return res
@@ -90,46 +96,14 @@ def get_bitmex():
         for item in data:
             s = item["symbol"]
             if "USDT" in s:
-                res.append((s, float(item["fundingRate"]) * 100, "BitMEX"))
+                res.append((s, float(item["fundingRate"]) * 100, "BitMEX", "8h"))
         return res
     except:
         return []
 
 
 # ======================================================================
-#                               КОМАНДА /funding
-# ======================================================================
-
-async def funding(update, context):
-    bb = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT").json()
-    binance_fr = float(bb["lastFundingRate"]) * 100
-
-    byb = requests.get("https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT").json()
-    bybit_fr = float(byb["result"]["list"][0]["fundingRate"]) * 100
-
-    okx = requests.get("https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP").json()
-    okx_fr = float(okx["data"][0]["fundingRate"]) * 100
-
-    der = requests.get("https://www.deribit.com/api/v2/public/get_funding_rate_value?instrument_name=BTC-PERPETUAL").json()
-    der_fr = float(der["result"]["funding_rate"]) * 100
-
-    bitm = requests.get("https://www.bitmex.com/api/v1/instrument?symbol=XBTUSDT&columns=fundingRate").json()
-    bitmex_fr = float(bitm[0]["fundingRate"]) * 100
-
-    msg = f"""
-📊 *Funding Rate BTCUSDT*
-
-🟡 Binance:   {binance_fr:.4f}%
-🟣 Bybit:     {bybit_fr:.4f}%
-🔵 OKX:       {okx_fr:.4f}%
-🟠 Deribit:   {der_fr:.4f}%
-⚫ BitMEX:    {bitmex_fr:.4f}%
-"""
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-
-# ======================================================================
-#                        КОМАНДА /fundingall — ВСЕ ПАРЫ
+#                               КОМАНДА /fundingall
 # ======================================================================
 
 async def funding_all(update, context):
@@ -146,10 +120,87 @@ async def funding_all(update, context):
 
     msg = "📊 *Funding всех USDT-пар (ТОП-50)*\n\n"
 
-    for symbol, fr, exch in all_pairs[:50]:
-        msg += f"{symbol}: {fr:.4f}% ({exch})\n"
+    for symbol, fr, exch, period in all_pairs[:50]:
+        msg += f"{symbol}: {fr:.4f}% ({exch}) ⏱ {period}\n"
 
     await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+# ======================================================================
+#                            КНОПКИ MENU
+# ======================================================================
+
+async def button(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "all_pairs":
+        await funding_all(update, context)
+
+    elif query.data == "negative":
+        # Отрицательные ставки
+        all_pairs = []
+        all_pairs.extend(get_binance())
+        all_pairs.extend(get_bybit())
+        all_pairs.extend(get_okx())
+        all_pairs.extend(get_deribit())
+        all_pairs.extend(get_bitmex())
+
+        # Фильтруем только отрицательные
+        negative_pairs = [pair for pair in all_pairs if pair[1] < 0]
+        negative_pairs.sort(key=lambda x: x[1])
+
+        msg = "📊 *Отрицательные ставки*\n\n"
+        for symbol, fr, exch, period in negative_pairs[:20]:
+            msg += f"{symbol}: {fr:.4f}% ({exch}) ⏱ {period}\n"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    elif query.data == "positive":
+        # Положительные ставки
+        all_pairs = []
+        all_pairs.extend(get_binance())
+        all_pairs.extend(get_bybit())
+        all_pairs.extend(get_okx())
+        all_pairs.extend(get_deribit())
+        all_pairs.extend(get_bitmex())
+
+        # Фильтруем только положительные
+        positive_pairs = [pair for pair in all_pairs if pair[1] > 0]
+        positive_pairs.sort(key=lambda x: x[1], reverse=True)
+
+        msg = "📊 *Положительные ставки*\n\n"
+        for symbol, fr, exch, period in positive_pairs[:20]:
+            msg += f"{symbol}: {fr:.4f}% ({exch}) ⏱ {period}\n"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    elif query.data == "top_5":
+        # ТОП 5 положительных и ТОП 5 отрицательных
+        all_pairs = []
+        all_pairs.extend(get_binance())
+        all_pairs.extend(get_bybit())
+        all_pairs.extend(get_okx())
+        all_pairs.extend(get_deribit())
+        all_pairs.extend(get_bitmex())
+
+        negative_pairs = [pair for pair in all_pairs if pair[1] < 0]
+        negative_pairs.sort(key=lambda x: x[1])
+
+        positive_pairs = [pair for pair in all_pairs if pair[1] > 0]
+        positive_pairs.sort(key=lambda x: x[1], reverse=True)
+
+        msg = "📊 *ТОП 5 Фандингов*\n\n"
+
+        msg += "🟥 *ТОП-5 Отрицательных ставок*\n"
+        for symbol, fr, exch, period in negative_pairs[:5]:
+            msg += f"{symbol}: {fr:.4f}% ({exch}) ⏱ {period}\n"
+
+        msg += "\n🟩 *ТОП-5 Положительных ставок*\n"
+        for symbol, fr, exch, period in positive_pairs[:5]:
+            msg += f"{symbol}: {fr:.4f}% ({exch}) ⏱ {period}\n"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 # ======================================================================
@@ -161,7 +212,6 @@ BOT_TOKEN = "8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0"
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("funding", funding))
-app.add_handler(CommandHandler("fundingall", funding_all))
+app.add_handler(CallbackQueryHandler(button))
 
 app.run_polling()
