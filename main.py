@@ -68,7 +68,7 @@ async def funding(update, context):
 
 
 # ---- Запуск бота ----
-BOT_TOKEN = "8329955590:AAH63Ax6WmTjESyLVvqEPTE5ibutOiK_rCM"
+BOT_TOKEN = "8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0"
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
