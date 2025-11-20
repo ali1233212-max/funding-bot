@@ -32,7 +32,8 @@ class FundingRateBot:
             # более корректный endpoint Bybit (v5, linear perp)
             "bybit": "https://api.bybit.com/v5/market/tickers?category=linear",
             "mexc": "https://contract.mexc.com/api/v1/contract/detail",
-            "okx": "https://www.okx.com/api/v5/public/funding-rate?instId=BTC-USDT-SWAP",
+            # OKX: список SWAP-инструментов, funding будем запрашивать отдельно
+            "okx": "https://www.okx.com/api/v5/public/instruments?instType=SWAP",
             "htx": "https://api.hbdm.com/swap-api/v1/swap_contract_info",
             "lbank": "https://api.lbank.info/v2/futures/fundingRate.do",
             "bitget": "https://api.bitget.com/api/mix/v1/market/contracts",
@@ -147,10 +148,77 @@ class FundingRateBot:
                             }
                         )
 
+            # ---------- OKX ----------
+            elif exchange == "okx":
+                # data — это ответ на /api/v5/public/instruments?instType=SWAP
+                instruments = data.get("data", [])
+                if not instruments:
+                    logger.warning("OKX: пустой список инструментов")
+                    return funding_data
+
+                try:
+                    # для каждого USDT-SWAP инструмента отдельно запрашиваем fundingRate
+                    async with aiohttp.ClientSession() as session:
+                        for inst in instruments:
+                            inst_id = inst.get("instId", "")
+                            # Нас интересуют только USDT-свопы вида BTC-USDT-SWAP
+                            if not inst_id.endswith("-USDT-SWAP"):
+                                continue
+
+                            fr_url = (
+                                f"https://www.okx.com/api/v5/public/funding-rate?instId={inst_id}"
+                            )
+                            try:
+                                async with session.get(fr_url, timeout=10) as resp:
+                                    if resp.status != 200:
+                                        logger.warning(
+                                            f"OKX funding-rate {inst_id}: HTTP {resp.status}"
+                                        )
+                                        continue
+                                    fr_json = await resp.json()
+                            except Exception as e:
+                                logger.error(
+                                    f"OKX запрос funding-rate {inst_id} упал: {e}"
+                                )
+                                continue
+
+                            try:
+                                fr_list = fr_json.get("data", [])
+                                if not fr_list:
+                                    continue
+                                fr_raw = fr_list[0].get("fundingRate")
+                                if fr_raw is None:
+                                    continue
+                                funding_rate = float(fr_raw) * 100.0  # в процентах
+                            except Exception as e:
+                                logger.error(
+                                    f"OKX парсинг fundingRate для {inst_id}: {e}"
+                                )
+                                continue
+
+                            interval_hours = self.funding_intervals["okx"]
+                            daily_payments = 24 / interval_hours
+                            annual_yield = funding_rate * daily_payments * 365
+
+                            symbol = inst_id.replace("-USDT-SWAP", "USDT")
+
+                            funding_data.append(
+                                {
+                                    "exchange": "okx",
+                                    "symbol": symbol,
+                                    "funding_rate": funding_rate,
+                                    "interval_hours": interval_hours,
+                                    "daily_payments": daily_payments,
+                                    "annual_yield": annual_yield,
+                                }
+                            )
+
+                except Exception as e:
+                    logger.error(f"Ошибка общего парсинга OKX: {e}")
+
             # ---------- ЗАГЛУШКИ ДЛЯ ОСТАЛЬНЫХ ----------
             elif exchange in [
                 "mexc",
-                "okx",
                 "htx",
                 "lbank",
                 "bitget",
