@@ -477,13 +477,13 @@ class FundingRateBot:
         return all_data
 
     def sort_funding_rates(self, data: List[Dict], sort_type: str = "negative") -> List[Dict]:
-        """Сортировка funding rates по убыванию величины (самые крупные сначала)"""
+        """Сортировка funding rates по годовой доходности"""
         if sort_type == "negative":
-            # Для отрицательных: от самых отрицательных (-1000%) к менее отрицательным
-            return sorted(data, key=lambda x: x["funding_rate"])
+            # Для отрицательных: от самой большой отрицательной годовой доходности к меньшей
+            return sorted(data, key=lambda x: x["annual_yield"])
         elif sort_type == "positive":
-            # Для положительных: от самых положительных (1000%) к менее положительным
-            return sorted(data, key=lambda x: x["funding_rate"], reverse=True)
+            # Для положительных: от самой большой положительной годовой доходности к меньшей
+            return sorted(data, key=lambda x: x["annual_yield"], reverse=True)
         return data
 
     def format_funding_message(self, data: List[Dict], start_idx: int = 0, limit: int = 20) -> str:
@@ -611,7 +611,7 @@ class FundingRateBot:
                         "short_daily_payments": highest["daily_payments"],
                     })
 
-        # Сортировка по потенциальной доходности (по убыванию)
+        # Сортировка арбитражных возможностей по годовой доходности (от большей к меньшей)
         opportunities.sort(key=lambda x: x["potential_yield"], reverse=True)
         return opportunities
 
@@ -726,7 +726,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if message_text == "📉 Все фандинги (отрицательные)":
             await update.message.reply_text("📊 Загружаю данные...")
             data = await bot.get_all_funding_rates()
-            # Сортировка отрицательных: самые отрицательные (-1000%) первыми
             sorted_data = bot.sort_funding_rates(data, "negative")
             
             user_sessions[user_id] = {
@@ -745,7 +744,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif message_text == "📈 Все фандинги (положительные)":
             await update.message.reply_text("📊 Загружаю данные...")
             data = await bot.get_all_funding_rates()
-            # Сортировка положительных: самые положительные (1000%) первыми
             sorted_data = bot.sort_funding_rates(data, "positive")
             
             user_sessions[user_id] = {
@@ -765,21 +763,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⭐ Загружаю данные...")
             data = await bot.get_all_funding_rates()
 
-            # Отрицательные: самые отрицательные (-1000%) первыми
+            # Сортируем по годовой доходности
             negative_data = [d for d in data if d["funding_rate"] < 0]
-            top_negative = bot.sort_funding_rates(negative_data, "negative")[:5]
+            top_negative = sorted(negative_data, key=lambda x: x["annual_yield"])[:5]  # Самые большие отрицательные
 
-            # Положительные: самые положительные (1000%) первыми
             positive_data = [d for d in data if d["funding_rate"] > 0]
-            top_positive = bot.sort_funding_rates(positive_data, "positive")[:5]
+            top_positive = sorted(positive_data, key=lambda x: x["annual_yield"], reverse=True)[:5]  # Самые большие положительные
 
             msg_neg = bot.format_funding_message(top_negative)
             msg_pos = bot.format_funding_message(top_positive)
 
-            await update.message.reply_text("▼ Топ 5 отрицательных фандингов (самые отрицательные первые):\n")
+            await update.message.reply_text("▼ Топ 5 отрицательных фандингов (по годовой доходности):\n")
             await update.message.reply_text(msg_neg)
 
-            await update.message.reply_text("▲ Топ 5 положительных фандингов (самые положительные первые):\n")
+            await update.message.reply_text("▲ Топ 5 положительных фандингов (по годовой доходности):\n")
             await update.message.reply_text(msg_pos)
 
         elif message_text == "🔄 Связки арбитража":
