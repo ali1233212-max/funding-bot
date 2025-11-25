@@ -1,4 +1,4 @@
-import asyncio
+mport asyncio
 import aiohttp
 import logging
 from datetime import datetime
@@ -24,14 +24,14 @@ class FundingRateBot:
     def __init__(self):
         # Эндпойнты бирж
         self.exchanges = {
-            "binance": "https://api.binance.com/fapi/v1/premiumIndex",
+            "binance": "https://fapi.binance.com/fapi/v1/premiumIndex",
             "bybit": "https://api.bybit.com/v5/market/tickers?category=linear",
-            "mexc": "https://contract.mexc.com/api/v1/contract/detail",
+            "mexc": "https://contract.mexc.com/api/v1/contract/ticker",
             "okx": "https://www.okx.com/api/v5/public/instruments?instType=SWAP",
-            "htx": "https://api.hbdm.com/swap-api/v1/swap_batch_funding_rate",
+            "htx": "https://api.htx.com/linear-swap-api/v1/swap_funding_rate",
             "lbank": "https://api.lbank.info/v2/futures/fundingRate.do",
             "bitget": "https://api.bitget.com/api/v2/mix/market/current-fund-rate?productType=USDT-FUTURES",
-            "gate": "https://api.gateio.ws/api/v4/futures/usdt/contracts",
+            "gate": "https://api.gateio.ws/api/v4/futures/usdt/tickers",
             "bingx": "https://api.bingx.com/openApi/swap/v2/quote/fundingRate",
         }
 
@@ -108,7 +108,7 @@ class FundingRateBot:
         """Получить интервал в часах с приоритетом: индивидуальный > из raw > дефолтный"""
         symbol = None
         if raw is not None:
-            symbol = raw.get("symbol") or raw.get("instId") or raw.get("contract_code")
+            symbol = raw.get("symbol") or raw.get("instId") or raw.get("contract_code") or raw.get("contract")
 
         # Per-symbol кэш для Binance/Bybit/OKX/Bitget
         if symbol:
@@ -126,17 +126,6 @@ class FundingRateBot:
                     interval = float(fri)
                     if interval > 0:
                         return interval
-                except (TypeError, ValueError):
-                    pass
-
-        # HTX: вычисляем интервал из next_funding_time и funding_time
-        if exchange == "htx" and raw is not None:
-            if 'next_funding_time' in raw and 'funding_time' in raw:
-                try:
-                    next_ts = int(raw['next_funding_time'])
-                    funding_ts = int(raw['funding_time'])
-                    interval_hours = (next_ts - funding_ts) / (1000 * 3600)
-                    return interval_hours
                 except (TypeError, ValueError):
                     pass
 
@@ -163,7 +152,10 @@ class FundingRateBot:
     async def fetch_exchange_data(self, session: aiohttp.ClientSession, exchange: str, url: str) -> List[Dict]:
         """Получение сырых данных с биржи"""
         try:
-            async with session.get(url, timeout=15) as response:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+            async with session.get(url, timeout=15, headers=headers) as response:
                 if response.status == 200:
                     data = await response.json()
                     return await self.parse_exchange_data(exchange, data)
@@ -290,8 +282,9 @@ class FundingRateBot:
 
                 for item in items:
                     symbol = item.get("symbol", "")
-                    if not symbol.endswith("USDT"):
+                    if not symbol.endswith("_UMCBL"):
                         continue
+                    symbol = symbol.replace("_UMCBL", "USDT")
 
                     fr_raw = item.get("fundingRate")
                     if fr_raw is None:
@@ -316,11 +309,50 @@ class FundingRateBot:
             elif exchange == "htx":
                 if data.get("status") == "ok":
                     for item in data.get("data", []):
-                        symbol = item.get("contract_code")
-                        if not symbol.endswith("USDT"):
+                        symbol = item.get("contract_code", "")
+                        if not symbol.endswith("-USDT"):
                             continue
+                        symbol = symbol.replace("-USDT", "USDT")
 
                         fr_raw = item.get("funding_rate")
+                        if fr_raw is None:
+                            continue
+                        try:
+                            funding_rate = float(fr_raw) * 100.0
+                        except (TypeError, ValueError):
+                            continue
+
+                        # Для HTX получаем интервал из времени следующего фандинга
+                        next_funding_time = item.get("next_funding_time")
+                        funding_time = item.get("funding_time")
+                        if next_funding_time and funding_time:
+                            try:
+                                interval_hours = (next_funding_time - funding_time) / (1000 * 3600)
+                            except:
+                                interval_hours = self.get_interval_hours(exchange, item)
+                        else:
+                            interval_hours = self.get_interval_hours(exchange, item)
+                        
+                        # Фильтрация по разрешенным интервалам
+                        if interval_hours not in allowed_intervals:
+                            continue
+                            
+                        funding_data.append(
+                            self.enrich_with_yield(exchange, symbol, funding_rate, interval_hours)
+                        )
+
+            # --- MEXC ---
+            elif exchange == "mexc":
+                if data.get("success") is True:
+                    for item in data.get("data", []):
+                        symbol = item.get("symbol", "")
+                        if not symbol.endswith("_USDT"):
+                            continue
+                        symbol = symbol.replace("_USDT", "USDT")
+
+                        fr_raw = item.get("fundingRate")
+                        if fr_raw is None:
+                            continue
                         try:
                             funding_rate = float(fr_raw) * 100.0
                         except (TypeError, ValueError):
@@ -336,9 +368,89 @@ class FundingRateBot:
                             self.enrich_with_yield(exchange, symbol, funding_rate, interval_hours)
                         )
 
-            # --- ЗАГЛУШКИ ДЛЯ ОСТАЛЬНЫХ ---
-            elif exchange in ["mexc", "lbank", "gate", "bingx"]:
-                logger.info(f"Парсер для {exchange} пока не реализован")
+            # --- BINGX ---
+            elif exchange == "bingx":
+                if data.get("code") == 0:
+                    for item in data.get("data", []):
+                        symbol = item.get("symbol", "")
+                        if not symbol.endswith("-USDT"):
+                            continue
+                        symbol = symbol.replace("-USDT", "USDT")
+
+                        fr_raw = item.get("fundingRate")
+                        if fr_raw is None:
+                            continue
+                        try:
+                            funding_rate = float(fr_raw) * 100.0
+                        except (TypeError, ValueError):
+                            continue
+
+                        interval_hours = self.get_interval_hours(exchange, item)
+                        
+                        # Фильтрация по разрешенным интервалам
+                        if interval_hours not in allowed_intervals:
+                            continue
+                            
+                        funding_data.append(
+                            self.enrich_with_yield(exchange, symbol, funding_rate, interval_hours)
+                        )
+
+            # --- GATE ---
+            elif exchange == "gate":
+                for item in data:
+                    symbol = item.get("name", "")
+                    if not symbol.endswith("_USDT"):
+                        continue
+                    symbol = symbol.replace("_USDT", "USDT")
+
+                    fr_raw = item.get("funding_rate")
+                    if fr_raw is None:
+                        continue
+                    try:
+                        funding_rate = float(fr_raw) * 100.0
+                    except (TypeError, ValueError):
+                        continue
+
+                    interval_hours = self.get_interval_hours(exchange, item)
+                    
+                    # Фильтрация по разрешенным интервалам
+                    if interval_hours not in allowed_intervals:
+                        continue
+                        
+                    funding_data.append(
+                        self.enrich_with_yield(exchange, symbol, funding_rate, interval_hours)
+                    )
+
+            # --- LBANK ---
+            elif exchange == "lbank":
+                items = data.get("data", [])
+                if not isinstance(items, list):
+                    logger.warning("LBank: неожиданный формат data")
+                    return funding_data
+
+                for item in items:
+                    symbol = item.get("symbol", "")
+                    if not symbol.endswith("_USDT"):
+                        continue
+                    symbol = symbol.replace("_USDT", "USDT")
+
+                    fr_raw = item.get("fundingRate")
+                    if fr_raw is None:
+                        continue
+                    try:
+                        funding_rate = float(fr_raw) * 100.0
+                    except (TypeError, ValueError):
+                        continue
+
+                    interval_hours = self.get_interval_hours(exchange, item)
+                    
+                    # Фильтрация по разрешенным интервалам
+                    if interval_hours not in allowed_intervals:
+                        continue
+                        
+                    funding_data.append(
+                        self.enrich_with_yield(exchange, symbol, funding_rate, interval_hours)
+                    )
 
         except Exception as e:
             logger.error(f"Ошибка парсинга {exchange}: {e}")
@@ -383,8 +495,9 @@ class FundingRateBot:
 
         end_idx = min(start_idx + limit, len(data))
         page_data = data[start_idx:end_idx]
+        total_pages = (len(data) + limit - 1) // limit
 
-        message = f"Страница {start_idx//limit + 1}/{(len(data)-1)//limit + 1}\n\n"
+        message = f"Страница {start_idx//limit + 1}/{total_pages}\n\n"
         
         for item in page_data:
             funding_sign = "+" if item["funding_rate"] > 0 else ""
@@ -399,7 +512,49 @@ class FundingRateBot:
 
         return message
 
-    async def get_arbitrage_opportunities(self, data: List[Dict]) -> List[str]:
+    def create_pagination_keyboard(self, current_page: int, total_pages: int, data_type: str, prefix: str = ""):
+        """Создание клавиатуры пагинации с быстрым перемещением"""
+        keyboard = []
+        
+        # Первая страница и предыдущая
+        if current_page > 0:
+            keyboard.extend([
+                InlineKeyboardButton("⏮️ Первая", callback_data=f"{prefix}first_{data_type}"),
+                InlineKeyboardButton("◀️ Назад", callback_data=f"{prefix}prev_{data_type}")
+            ])
+        
+        # Номер текущей страницы
+        keyboard.append(InlineKeyboardButton(f"{current_page + 1}/{total_pages}", callback_data=f"{prefix}current_{data_type}"))
+        
+        # Следующая и последняя страница
+        if current_page < total_pages - 1:
+            keyboard.extend([
+                InlineKeyboardButton("Вперед ▶️", callback_data=f"{prefix}next_{data_type}"),
+                InlineKeyboardButton("Последняя ⏭️", callback_data=f"{prefix}last_{data_type}")
+            ])
+        
+        # Быстрое перемещение по страницам
+        quick_nav = []
+        pages_to_show = []
+        
+        # Показываем первые 3, последние 3 и текущую с соседями
+        for i in range(total_pages):
+            if i < 3 or i >= total_pages - 3 or abs(i - current_page) <= 1:
+                pages_to_show.append(i)
+        
+        # Убираем дубликаты и сортируем
+        pages_to_show = sorted(set(pages_to_show))
+        
+        for i, page in enumerate(pages_to_show):
+            if i > 0 and page - pages_to_show[i-1] > 1:
+                quick_nav.append(InlineKeyboardButton("...", callback_data=f"{prefix}dots_{data_type}"))
+            
+            label = f"•{page+1}•" if page == current_page else str(page+1)
+            quick_nav.append(InlineKeyboardButton(label, callback_data=f"{prefix}page_{data_type}_{page}"))
+        
+        return InlineKeyboardMarkup([keyboard, quick_nav] if quick_nav else [keyboard])
+
+    async def get_arbitrage_opportunities(self, data: List[Dict]) -> List[Dict]:
         """Поиск арбитражных возможностей с учетом разных интервалов выплат"""
         symbol_groups: Dict[str, List[Dict]] = {}
 
@@ -454,15 +609,20 @@ class FundingRateBot:
                     })
 
         opportunities.sort(key=lambda x: x["potential_yield"], reverse=True)
+        return opportunities
 
-        if not opportunities:
-            return ["Арбитражные возможности не найдены"]
+    def format_arbitrage_message(self, data: List[Dict], start_idx: int = 0, limit: int = 20) -> str:
+        """Формирование сообщения с арбитражными возможностями"""
+        if not data:
+            return "Арбитражные возможности не найдены"
 
-        # Формируем сообщения
-        chunks = []
-        current = "📌 Арбитражные возможности:\n\n"
+        end_idx = min(start_idx + limit, len(data))
+        page_data = data[start_idx:end_idx]
+        total_pages = (len(data) + limit - 1) // limit
 
-        for opp in opportunities:
+        message = f"📌 Арбитражные возможности (страница {start_idx//limit + 1}/{total_pages}):\n\n"
+
+        for opp in page_data:
             line = (
                 f"Пара: {opp['symbol']}\n"
                 f"▲ ЛОНГ на {opp['long_exchange'].upper()} "
@@ -477,17 +637,9 @@ class FundingRateBot:
                 
             line += f"Потенциальная годовая доходность: {opp['potential_yield']:.2f}%\n"
             line += f"{'-'*30}\n"
+            message += line
 
-            if len(current) + len(line) > 3500:
-                chunks.append(current)
-                current = line
-            else:
-                current += line
-
-        if current:
-            chunks.append(current)
-
-        return chunks
+        return message
 
 # ====================== ЭКЗЕМПЛЯР БОТА ======================
 bot = FundingRateBot()
@@ -515,7 +667,7 @@ async def handle_pagination(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     user_id = query.from_user.id
-    data = query.data.split("_")
+    callback_data = query.data
     
     if user_id not in user_sessions:
         await query.edit_message_text("Сессия истекла. Начните заново.")
@@ -524,28 +676,37 @@ async def handle_pagination(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session_data = user_sessions[user_id]
     data_type = session_data["type"]
     all_data = session_data["data"]
+    current_page = session_data.get("page", 0)
+    limit = session_data.get("limit", 20)
+    total_pages = (len(all_data) + limit - 1) // limit
+
+    # Обработка действий пагинации
+    if callback_data.startswith("first_"):
+        new_page = 0
+    elif callback_data.startswith("prev_"):
+        new_page = max(0, current_page - 1)
+    elif callback_data.startswith("next_"):
+        new_page = min(total_pages - 1, current_page + 1)
+    elif callback_data.startswith("last_"):
+        new_page = total_pages - 1
+    elif callback_data.startswith("page_"):
+        try:
+            _, _, data_type, page_str = callback_data.split("_")
+            new_page = int(page_str)
+        except:
+            new_page = current_page
+    else:
+        new_page = current_page
+
+    user_sessions[user_id]["page"] = new_page
     
-    if data[0] == "prev":
-        new_start = max(0, session_data["start"] - 20)
-    else:  # next
-        new_start = min(session_data["start"] + 20, len(all_data) - 1)
-    
-    user_sessions[user_id] = {
-        "type": data_type,
-        "data": all_data,
-        "start": new_start
-    }
-    
-    message_text = bot.format_funding_message(all_data, new_start, 20)
-    
-    # Создаем кнопки пагинации
-    keyboard = []
-    if new_start > 0:
-        keyboard.append(InlineKeyboardButton("⬅️ Назад", callback_data="prev_"))
-    if new_start + 20 < len(all_data):
-        keyboard.append(InlineKeyboardButton("Вперед ➡️", callback_data="next_"))
-    
-    reply_markup = InlineKeyboardMarkup([keyboard]) if keyboard else None
+    # Форматирование сообщения в зависимости от типа данных
+    if data_type in ["negative", "positive"]:
+        message_text = bot.format_funding_message(all_data, new_page * limit, limit)
+        reply_markup = bot.create_pagination_keyboard(new_page, total_pages, data_type)
+    elif data_type == "arbitrage":
+        message_text = bot.format_arbitrage_message(all_data, new_page * limit, limit)
+        reply_markup = bot.create_pagination_keyboard(new_page, total_pages, data_type, "arb_")
     
     await query.edit_message_text(
         text=message_text,
@@ -566,17 +727,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_sessions[user_id] = {
                 "type": "negative",
                 "data": sorted_data,
-                "start": 0
+                "page": 0,
+                "limit": 20
             }
             
             message_text = bot.format_funding_message(sorted_data, 0, 20)
-            
-            # Кнопки пагинации
-            keyboard = []
-            if len(sorted_data) > 20:
-                keyboard.append(InlineKeyboardButton("Вперед ➡️", callback_data="next_"))
-            
-            reply_markup = InlineKeyboardMarkup([keyboard]) if keyboard else None
+            total_pages = (len(sorted_data) + 20 - 1) // 20
+            reply_markup = bot.create_pagination_keyboard(0, total_pages, "negative")
             
             await update.message.reply_text(message_text, reply_markup=reply_markup)
 
@@ -588,17 +745,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_sessions[user_id] = {
                 "type": "positive",
                 "data": sorted_data,
-                "start": 0
+                "page": 0,
+                "limit": 20
             }
             
             message_text = bot.format_funding_message(sorted_data, 0, 20)
-            
-            # Кнопки пагинации
-            keyboard = []
-            if len(sorted_data) > 20:
-                keyboard.append(InlineKeyboardButton("Вперед ➡️", callback_data="next_"))
-            
-            reply_markup = InlineKeyboardMarkup([keyboard]) if keyboard else None
+            total_pages = (len(sorted_data) + 20 - 1) // 20
+            reply_markup = bot.create_pagination_keyboard(0, total_pages, "positive")
             
             await update.message.reply_text(message_text, reply_markup=reply_markup)
 
@@ -612,21 +765,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             positive_data = [d for d in data if d["funding_rate"] > 0]
             top_positive = bot.sort_funding_rates(positive_data, "positive")[:5]
 
-            msg_neg_chunks = bot.format_funding_message(top_negative)
-            msg_pos_chunks = bot.format_funding_message(top_positive)
+            msg_neg = bot.format_funding_message(top_negative)
+            msg_pos = bot.format_funding_message(top_positive)
 
             await update.message.reply_text("▼ Топ 5 отрицательных фандингов:\n")
-            await update.message.reply_text(msg_neg_chunks)
+            await update.message.reply_text(msg_neg)
 
             await update.message.reply_text("▲ Топ 5 положительных фандингов:\n")
-            await update.message.reply_text(msg_pos_chunks)
+            await update.message.reply_text(msg_pos)
 
         elif message_text == "🔄 Связки арбитража":
             await update.message.reply_text("🔄 Ищу арбитражные возможности...")
             data = await bot.get_all_funding_rates()
-            chunks = await bot.get_arbitrage_opportunities(data)
-            for chunk in chunks:
-                await update.message.reply_text(chunk)
+            opportunities = await bot.get_arbitrage_opportunities(data)
+            
+            user_sessions[user_id] = {
+                "type": "arbitrage",
+                "data": opportunities,
+                "page": 0,
+                "limit": 10
+            }
+            
+            message_text = bot.format_arbitrage_message(opportunities, 0, 10)
+            total_pages = (len(opportunities) + 10 - 1) // 10
+            reply_markup = bot.create_pagination_keyboard(0, total_pages, "arbitrage", "arb_")
+            
+            await update.message.reply_text(message_text, reply_markup=reply_markup)
 
         elif message_text == "🔄 Обновить данные":
             await update.message.reply_text("✅ Данные всегда обновляются при каждом запросе!")
@@ -639,7 +803,7 @@ def main():
     application = Application.builder().token(BOT_TOKEN).build()
     
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(handle_pagination, pattern="^(prev|next)_"))
+    application.add_handler(CallbackQueryHandler(handle_pagination, pattern="^(first|prev|next|last|page|arb_).*"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("Бот запущен (polling)...")
