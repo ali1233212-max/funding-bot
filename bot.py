@@ -8,10 +8,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # Токены (ЗАМЕНИ НА СВОИ)
-TELEGRAM_TOKEN = "8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0"
-COINGLASS_TOKEN = "2d73a05799f64daab80329868a5264ea"
+TELEGRAM_TOKEN = "PUT_TELEGRAM_TOKEN_HERE"
+COINGLASS_TOKEN = "PUT_COINGLASS_TOKEN_HERE"
 
-# Настройка логирования
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -39,30 +38,15 @@ class CoinglassAPI:
             "CG-API-KEY": COINGLASS_TOKEN,
         }
 
-    # ========= ФАНДИНГ (v4) =========
-
     def get_funding_rates(self):
         """
-        ТЯЖЁЛЫЙ запрос: получить ВСЕ ставки фандинга по всем монетам и биржам
-        через v4 /futures/funding-rate/exchange-list.
-
-        Возвращает список в формате, совместимом с твоим старым кодом:
-        [
-          {
-            'symbol': 'BTC',
-            'exchangeName': 'Binance',
-            'uMarginList': [{'rate': 0.00123}],
-            'marginType': 'USDT',
-            'interval': 8
-          },
-          ...
-        ]
-        Этот метод вызывается только из фонового крона (кэш), а не из команд.
+        ТЯЖЁЛЫЙ запрос: получить ВСЕ ставки фандинга по всем монетам и биржам.
+        Вызывается только в фоне для обновления кэша.
         """
         url = f"{self.base_url_v4}/futures/funding-rate/exchange-list"
 
         MAX_RETRIES = 3
-        TIMEOUT = 60  # можем позволить себе большой таймаут, т.к. это фоновый запрос
+        TIMEOUT = 60
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -88,7 +72,7 @@ class CoinglassAPI:
                     stable_list = entry.get("stablecoin_margin_list") or []
                     token_list = entry.get("token_margin_list") or []
 
-                    # USDT / USD маржа -> мапим в uMarginList
+                    # USDT / USD маржа
                     for row in stable_list:
                         try:
                             rate = float(row.get("funding_rate", 0.0))
@@ -103,7 +87,7 @@ class CoinglassAPI:
                         }
                         result.append(item)
 
-                    # Coin-маржа -> тоже в uMarginList, но помечаем marginType=COIN
+                    # COIN маржа
                     for row in token_list:
                         try:
                             rate = float(row.get("funding_rate", 0.0))
@@ -129,8 +113,6 @@ class CoinglassAPI:
                 )
                 if attempt == MAX_RETRIES:
                     return None
-                # следующая попытка
-
             except Exception as e:
                 logger.exception(
                     "Ошибка при запросе к Coinglass v4 funding-rate/exchange-list: %s",
@@ -143,10 +125,6 @@ class CoinglassAPI:
     ):
         """
         Посчитать арбитраж фандинга по уже загруженному списку funding_items.
-
-        funding_items — это список в формате, который возвращает get_funding_rates().
-        symbol — если задан, считаем только для этой монеты.
-        min_spread — минимальный спред (в долях), чтобы учитывать ситуацию.
         """
         if not funding_items:
             return None
@@ -163,15 +141,11 @@ class CoinglassAPI:
 
             margin_type = item.get("marginType", "USDT")
             if margin_type != "USDT":
-                # для простоты считаем арбитраж только по USDT-марже
                 continue
 
             rate_list = item.get("uMarginList", [{}])
             rate = rate_list[0].get("rate", 0) if rate_list else 0
-            exchange = item.get("exchangeName", "")
-
-            if exchange is None:
-                exchange = ""
+            exchange = item.get("exchangeName", "") or ""
 
             if not exchange:
                 continue
@@ -213,10 +187,8 @@ class CoinglassAPI:
         opportunities.sort(key=lambda x: abs(x["spread"]), reverse=True)
         return opportunities
 
-    # ========= ЦЕНОВОЙ АРБИТРАЖ (v3) =========
-
     def get_arbitrage_opportunities(self):
-        """Получить арбитражные возможности по ЦЕНЕ (старый v3 /futures/market, BTC)."""
+        """Ценовой арбитраж по BTC через v3 /futures/market."""
         url = f"{self.base_url_v3}/futures/market"
         params = {"symbol": "BTC"}
 
@@ -237,7 +209,6 @@ class CoinglassAPI:
             return None
 
     def _calculate_arbitrage(self, market_data):
-        """Рассчитать арбитражные возможности по ЦЕНЕ."""
         opportunities = []
 
         for coin_data in market_data:
@@ -257,7 +228,7 @@ class CoinglassAPI:
                 if min_price > 0:
                     spread_percent = ((max_price - min_price) / min_price) * 100
 
-                    if spread_percent > 0.5:  # Фильтр минимального спреда
+                    if spread_percent > 0.5:
                         opportunities.append(
                             {
                                 "symbol": symbol,
@@ -275,20 +246,12 @@ class CryptoArbBot:
     def __init__(self):
         self.api = CoinglassAPI()
         self.application = Application.builder().token(TELEGRAM_TOKEN).build()
-
-        # Кэш фандинга (вся выборка по всем монетам/биржам)
         self.funding_cache: list[dict] = []
         self.funding_cache_updated_at: datetime | None = None
-
         self.setup_handlers()
 
-    # ---------- КЭШ ----------
-
     async def update_funding_cache(self, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Фоновое обновление кэша фандинга.
-        Запускается через job_queue раз в N секунд.
-        """
+        """Фоновое обновление кэша фандинга."""
         try:
             data = await asyncio.to_thread(self.api.get_funding_rates)
             if data:
@@ -303,10 +266,7 @@ class CryptoArbBot:
             logger.exception("Не удалось обновить кэш фандинга: %s", e)
 
     def get_cached_funding(self, symbol: str | None = None):
-        """
-        Вернуть данные из кэша.
-        Если symbol задан — фильтруем только по этой монете.
-        """
+        """Вернуть данные из кэша, при необходимости отфильтрованные по монете."""
         if not self.funding_cache:
             return None
 
@@ -320,10 +280,7 @@ class CryptoArbBot:
 
         return self.funding_cache
 
-    # ---------- Хэндлеры ----------
-
     def setup_handlers(self):
-        """Настройка обработчиков команд"""
         self.application.add_handler(CommandHandler("start", self.start))
         self.application.add_handler(CommandHandler("funding", self.funding_rates))
         self.application.add_handler(CommandHandler("arbitrage", self.arbitrage))
@@ -332,7 +289,6 @@ class CryptoArbBot:
         self.application.add_handler(CallbackQueryHandler(self.button_handler))
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик команды /start"""
         keyboard = [
             [
                 InlineKeyboardButton("📊 Фандинг ставки", callback_data="funding"),
@@ -360,9 +316,7 @@ class CryptoArbBot:
             welcome_text, reply_markup=reply_markup, parse_mode="HTML"
         )
 
-    # ---------- /funding ----------
-
-      async def funding_rates(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def funding_rates(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать фандинг ставки (из кэша)"""
         await update.message.reply_text("🔄 Получаю данные о фандинг ставках из кэша...")
 
@@ -382,18 +336,19 @@ class CryptoArbBot:
         header = symbol if symbol else "всех монет"
         response = f"📊 <b>Текущие фандинг ставки для {header}:</b>\n\n"
 
-        # Если запрошен конкретный тикер (например /funding BTC) —
-        # показываем ВСЕ биржи для этой монеты, без обрезки.
+        # Если указан тикер (например /funding BTC) — показываем все биржи по этой монете
         if symbol:
             items_to_show = sorted(
                 funding_data,
                 key=lambda x: (x.get("marginType", ""), x.get("exchangeName", "")),
             )
         else:
-            # Если тикер не задан — берём топ по абсолютному значению ставки (чтобы не заспамить чат).
+            # Без тикера — топ по абсолютному значению ставки (чтобы не заспамить чат)
             items_to_show = sorted(
                 funding_data,
-                key=lambda x: abs(float(x.get("uMarginList", [{}])[0].get("rate", 0) or 0)),
+                key=lambda x: abs(
+                    float(x.get("uMarginList", [{}])[0].get("rate", 0) or 0)
+                ),
                 reverse=True,
             )[:15]
 
@@ -423,10 +378,8 @@ class CryptoArbBot:
 
         await update.message.reply_text(response, parse_mode="HTML")
 
-    # ---------- /arbitrage (по цене) ----------
-
     async def arbitrage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать арбитражные возможности по ЦЕНЕ (v3 /futures/market)"""
+        """Показать арбитражные возможности по ЦЕНЕ (BTC)"""
         await update.message.reply_text("🔍 Ищу арбитражные возможности по цене...")
 
         arb_opportunities = self.api.get_arbitrage_opportunities()
@@ -439,15 +392,13 @@ class CryptoArbBot:
 
         response = "💸 <b>Арбитражные возможности по цене (BTC):</b>\n\n"
 
-        for opp in arb_opportunities[:10]:  # Топ 10 возможностей
+        for opp in arb_opportunities[:10]:
             response += f"🎯 <b>{opp['symbol']}</b>\n"
             response += f"   Спред: {opp['spread_percent']}%\n"
             response += f"   Мин: ${opp['min_price']:.2f}\n"
             response += f"   Макс: ${opp['max_price']:.2f}\n\n"
 
         await update.message.reply_text(response, parse_mode="HTML")
-
-    # ---------- /top_funding ----------
 
     async def top_funding(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Топ высоких фандинг ставок (из кэша)"""
@@ -475,7 +426,9 @@ class CryptoArbBot:
 
         sorted_data = sorted(
             filtered_data,
-            key=lambda x: abs(float(x.get("uMarginList", [{}])[0].get("rate", 0) or 0)),
+            key=lambda x: abs(
+                float(x.get("uMarginList", [{}])[0].get("rate", 0) or 0)
+            ),
             reverse=True,
         )
 
@@ -501,8 +454,6 @@ class CryptoArbBot:
             response += f"   Ставка: {rate_percent}% за {interval}ч\n\n"
 
         await update.message.reply_text(response, parse_mode="HTML")
-
-    # ---------- /arb_funding ----------
 
     async def arb_funding(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Арбитраж фандинга между биржами (из кэша)"""
@@ -558,10 +509,7 @@ class CryptoArbBot:
 
         await update.message.reply_text(response, parse_mode="HTML")
 
-    # ---------- КНОПКИ ----------
-
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик нажатий на кнопки"""
         query = update.callback_query
         await query.answer()
 
@@ -575,7 +523,6 @@ class CryptoArbBot:
             await self.arb_funding_callback(query)
 
     async def funding_rates_callback(self, query):
-        """Обработчик кнопки фандинга (из кэша)"""
         await query.edit_message_text("🔄 Получаю данные о фандинг ставках из кэша...")
 
         funding_data = self.get_cached_funding()
@@ -591,7 +538,9 @@ class CryptoArbBot:
 
         filtered = sorted(
             funding_data,
-            key=lambda x: abs(float(x.get("uMarginList", [{}])[0].get("rate", 0) or 0)),
+            key=lambda x: abs(
+                float(x.get("uMarginList", [{}])[0].get("rate", 0) or 0)
+            ),
             reverse=True,
         )
 
@@ -622,7 +571,6 @@ class CryptoArbBot:
         await query.edit_message_text(response, parse_mode="HTML")
 
     async def arbitrage_callback(self, query):
-        """Обработчик кнопки арбитража цены"""
         await query.edit_message_text("🔍 Ищу арбитражные возможности по цене...")
 
         arb_opportunities = self.api.get_arbitrage_opportunities()
@@ -644,7 +592,6 @@ class CryptoArbBot:
         await query.edit_message_text(response, parse_mode="HTML")
 
     async def top_funding_callback(self, query):
-        """Обработчик кнопки топа фандинга (из кэша)"""
         await query.edit_message_text("📈 Ищу самые высокие фандинг ставки в кэше...")
 
         funding_data = self.get_cached_funding()
@@ -669,7 +616,9 @@ class CryptoArbBot:
 
         sorted_data = sorted(
             filtered_data,
-            key=lambda x: abs(float(x.get("uMarginList", [{}])[0].get("rate", 0) or 0)),
+            key=lambda x: abs(
+                float(x.get("uMarginList", [{}])[0].get("rate", 0) or 0)
+            ),
             reverse=True,
         )
 
@@ -697,7 +646,6 @@ class CryptoArbBot:
         await query.edit_message_text(response, parse_mode="HTML")
 
     async def arb_funding_callback(self, query):
-        """Обработчик кнопки арбитража фандинга (из кэша)"""
         await query.edit_message_text("⚖️ Ищу арбитраж фандинга между биржами...")
 
         items = self.get_cached_funding()
@@ -741,17 +689,14 @@ class CryptoArbBot:
 
         await query.edit_message_text(response, parse_mode="HTML")
 
-    # ---------- Запуск ----------
-
     def run(self):
-        """Запуск бота"""
         print("🤖 Бот запущен...")
 
-        # Фоновый джоб: обновляем кэш фандинга каждые 60 секунд
+        # фоновое обновление кэша раз в 60 секунд
         self.application.job_queue.run_repeating(
             self.update_funding_cache,
-            interval=60,  # каждые 60 секунд
-            first=0,      # сразу после старта
+            interval=60,
+            first=0,
         )
 
         self.application.run_polling()
