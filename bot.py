@@ -423,7 +423,6 @@ class CryptoArbBot:
 
         await update.message.reply_text(response, parse_mode="HTML")
 
-
     # ---------- /arbitrage (по цене) ----------
 
     async def arbitrage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
