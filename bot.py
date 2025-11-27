@@ -6,8 +6,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # Токены читаем из переменных окружения (так безопаснее)
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-COINGLASS_TOKEN = os.getenv("COINGLASS_API_KEY")
+TELEGRAM_TOKEN = os.getenv("8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0")
+COINGLASS_TOKEN = os.getenv("2d73a05799f64daab80329868a5264ea")
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
