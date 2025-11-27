@@ -1,18 +1,16 @@
 import os
 import logging
 import requests
-import pandas as pd  # сейчас не используется, но оставляем на будущее
+import pandas as pd  # оставляю, как просила, на будущее
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# Токены читаем из переменных окружения (так безопаснее)
-TELEGRAM_TOKEN = os.getenv("8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0")
-COINGLASS_TOKEN = os.getenv("2d73a05799f64daab80329868a5264ea")
+# 🔐 СЮДА ВСТАВЬ СВОИ ТОКЕНЫ (СТРОКАМИ БЕЗ КАВЫЧЕК СБОКУ)
+# Например: TELEGRAM_TOKEN = "1234567890:AA...."
+#           COINGLASS_TOKEN = "2d73a0...."
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
-if not COINGLASS_TOKEN:
-    raise RuntimeError("COINGLASS_API_KEY не задан в переменных окружения")
+TELEGRAM_TOKEN = "8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0"      # <-- ВСТАВЬ СВОЙ TELEGRAM ТОКЕН
+COINGLASS_TOKEN = "2d73a05799f64daab80329868a5264ea"    # <-- ВСТАВЬ СВОЙ COINGLASS ТОКЕН
 
 # Настройка логирования
 logging.basicConfig(
@@ -52,7 +50,6 @@ class CoinglassAPI:
             resp = requests.get(url, headers=self.headers_v3, params=params, timeout=10)
             resp.raise_for_status()
             data = resp.json()
-            # для v3 обычно success / data
             if data.get("success"):
                 return data.get("data", [])
             logger.warning("Coinglass v3 funding_rates вернул неуспех: %s", data)
@@ -82,7 +79,6 @@ class CoinglassAPI:
 
     def _calculate_price_arbitrage(self, market_data):
         """
-        Раньше назывался _calculate_arbitrage.
         Считает спреды по ценам между биржами.
         """
         opportunities = []
@@ -108,7 +104,7 @@ class CoinglassAPI:
 
             spread_percent = (max_price - min_price) / min_price * 100
 
-            if spread_percent > 0.5:  # минимальный ценовой спред
+            if spread_percent > 0.5:
                 opportunities.append(
                     {
                         "symbol": symbol,
@@ -136,7 +132,6 @@ class CoinglassAPI:
         url = f"{self.base_url_v4}/futures/funding-rate/exchange-list"
         params = {}
         if symbols:
-            # если нужен фильтр по монетам – ожидаем список строк
             params["symbol"] = ",".join([s.upper() for s in symbols])
 
         try:
@@ -152,11 +147,9 @@ class CoinglassAPI:
             for entry in data.get("data", []):
                 symbol = entry.get("symbol")
                 stable_list = entry.get("stablecoin_margin_list") or []
-                # смотрим только USDT/USD маржу для начала
                 if len(stable_list) < 2:
                     continue
 
-                # funding_rate уже float по доке v4
                 try:
                     min_row = min(stable_list, key=lambda r: float(r.get("funding_rate", 0.0)))
                     max_row = max(stable_list, key=lambda r: float(r.get("funding_rate", 0.0)))
@@ -227,14 +220,24 @@ class CryptoArbBot:
             "Используйте кнопки ниже для быстрого доступа!"
         )
 
-        await update.message.reply_text(
-            welcome_text,
-            reply_markup=reply_markup,
-            parse_mode="HTML",
-        )
+        if update.message:
+            await update.message.reply_text(
+                welcome_text,
+                reply_markup=reply_markup,
+                parse_mode="HTML",
+            )
+        elif update.callback_query:
+            await update.callback_query.edit_message_text(
+                welcome_text,
+                reply_markup=reply_markup,
+                parse_mode="HTML",
+            )
 
     async def funding_rates(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать фандинг ставки (агрегированно по API v3)"""
+        """Показать фандинг ставки (по v3 API)"""
+        if not update.message:
+            return
+
         await update.message.reply_text("🔄 Получаю данные о фандинг ставках...")
 
         symbol = None
@@ -271,7 +274,10 @@ class CryptoArbBot:
         await update.message.reply_text(response, parse_mode="HTML")
 
     async def arbitrage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать арбитражные возможности по цене"""
+        """Показать арбитражные возможности по цене (v3)"""
+        if not update.message:
+            return
+
         await update.message.reply_text("🔍 Ищу арбитражные возможности по цене...")
 
         arb_opportunities = self.api.get_arbitrage_opportunities()
@@ -293,7 +299,10 @@ class CryptoArbBot:
         await update.message.reply_text(response, parse_mode="HTML")
 
     async def top_funding(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Топ высоких фандинг ставок"""
+        """Топ высоких фандинг ставок по v3"""
+        if not update.message:
+            return
+
         await update.message.reply_text("📈 Ищу самые высокие фандинг ставки...")
 
         funding_data = self.api.get_funding_rates()
@@ -344,7 +353,10 @@ class CryptoArbBot:
         await update.message.reply_text(response, parse_mode="HTML")
 
     async def arb_funding(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Арбитраж фандинга между биржами (v4 funding-rate/exchange-list)"""
+        """Арбитраж фандинга между биржами (v4)"""
+        if not update.message:
+            return
+
         await update.message.reply_text("⚖️ Ищу арбитраж фандинга между биржами...")
 
         symbols = None
@@ -544,7 +556,6 @@ class CryptoArbBot:
     def run(self):
         """Запуск бота"""
         print("🤖 Бот запущен...")
-        print("📱 Перейдите в Telegram и отправьте /start вашему боту")
         self.application.run_polling()
 
 
