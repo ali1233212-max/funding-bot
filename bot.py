@@ -1,13 +1,11 @@
 import logging
 import asyncio
 from datetime import datetime, timezone
-
 import requests
-import pandas as pd  # пока не используется, но оставляем
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
-# Токены (ЗАМЕНИ НА СВОИ)
+# Токены
 TELEGRAM_TOKEN = "8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0"
 COINGLASS_TOKEN = "2d73a05799f64daab80329868a5264ea"
 
@@ -17,34 +15,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 class CoinglassAPI:
-    """
-    Класс-обёртка над Coinglass API.
-    - v4: фандинг по всем монетам и биржам
-    - v3: арбитраж по ЦЕНЕ (futures/market)
-    """
-
     def __init__(self):
-        self.base_url_v3 = "https://open-api.coinglass.com/api/pro/v1"
         self.base_url_v4 = "https://open-api-v4.coinglass.com/api"
-
-        self.headers_v3 = {
-            "accept": "application/json",
-            "coinglassSecret": COINGLASS_TOKEN,
-        }
         self.headers_v4 = {
             "accept": "application/json",
             "CG-API-KEY": COINGLASS_TOKEN,
         }
 
     def get_funding_rates(self):
-        """
-        ТЯЖЁЛЫЙ запрос: получить ВСЕ ставки фандинга по всем монетам и биржам.
-        Вызывается только в фоне для обновления кэша.
-        """
         url = f"{self.base_url_v4}/futures/funding-rate/exchange-list"
-
         MAX_RETRIES = 3
         TIMEOUT = 60
 
@@ -57,33 +37,32 @@ class CoinglassAPI:
                 )
                 resp.raise_for_status()
                 data = resp.json()
-
+                
                 if data.get("code") != "0":
-                    logger.warning(
-                        "Coinglass v4 funding-rate/exchange-list error: %s", data
-                    )
+                    logger.warning("Coinglass v4 funding-rate/exchange-list error: %s", data)
                     return None
 
                 entries = data.get("data", [])
-                result: list[dict] = []
+                result = []
 
                 for entry in entries:
                     sym = entry.get("symbol", "")
                     stable_list = entry.get("stablecoin_margin_list") or []
                     token_list = entry.get("token_margin_list") or []
 
-                    # USDT / USD маржа
+                    # USDT маржа
                     for row in stable_list:
                         try:
                             rate = float(row.get("funding_rate", 0.0))
                         except (TypeError, ValueError):
                             rate = 0.0
+                            
                         item = {
                             "symbol": sym,
                             "exchangeName": row.get("exchange", ""),
-                            "uMarginList": [{"rate": rate}],
+                            "rate": rate,
                             "marginType": "USDT",
-                            "interval": row.get("funding_rate_interval"),
+                            "interval": row.get("funding_rate_interval", "?"),
                         }
                         result.append(item)
 
@@ -93,12 +72,13 @@ class CoinglassAPI:
                             rate = float(row.get("funding_rate", 0.0))
                         except (TypeError, ValueError):
                             rate = 0.0
+                            
                         item = {
                             "symbol": sym,
                             "exchangeName": row.get("exchange", ""),
-                            "uMarginList": [{"rate": rate}],
+                            "rate": rate,
                             "marginType": "COIN",
-                            "interval": row.get("funding_rate_interval"),
+                            "interval": row.get("funding_rate_interval", "?"),
                         }
                         result.append(item)
 
@@ -106,601 +86,313 @@ class CoinglassAPI:
                 return result
 
             except requests.exceptions.ReadTimeout:
-                logger.warning(
-                    "Таймаут при запросе к Coinglass v4 funding-rate (попытка %d/%d)",
-                    attempt,
-                    MAX_RETRIES,
-                )
+                logger.warning("Таймаут при запросе к Coinglass v4 (попытка %d/%d)", attempt, MAX_RETRIES)
                 if attempt == MAX_RETRIES:
                     return None
             except Exception as e:
-                logger.exception(
-                    "Ошибка при запросе к Coinglass v4 funding-rate/exchange-list: %s",
-                    e,
-                )
+                logger.exception("Ошибка при запросе к Coinglass v4: %s", e)
                 return None
-
-    def calculate_funding_arbitrage_from_items(
-        self, funding_items: list[dict], symbol: str | None = None, min_spread: float = 0.0005
-    ):
-        """
-        Посчитать арбитраж фандинга по уже загруженному списку funding_items.
-        """
-        if not funding_items:
-            return None
-
-        by_symbol: dict[str, list[tuple[str, float]]] = {}
-
-        for item in funding_items:
-            sym = item.get("symbol", "")
-            if not sym:
-                continue
-
-            if symbol and sym.upper() != symbol.upper():
-                continue
-
-            margin_type = item.get("marginType", "USDT")
-            if margin_type != "USDT":
-                continue
-
-            rate_list = item.get("uMarginList", [{}])
-            rate = rate_list[0].get("rate", 0) if rate_list else 0
-            exchange = item.get("exchangeName", "") or ""
-
-            if not exchange:
-                continue
-
-            try:
-                r = float(rate)
-            except (TypeError, ValueError):
-                continue
-
-            by_symbol.setdefault(sym, []).append((exchange, r))
-
-        opportunities: list[dict] = []
-
-        for sym, ex_rates in by_symbol.items():
-            if len(ex_rates) < 2:
-                continue
-
-            min_ex, min_rate = min(ex_rates, key=lambda x: x[1])
-            max_ex, max_rate = max(ex_rates, key=lambda x: x[1])
-            spread = max_rate - min_rate
-
-            if abs(spread) < min_spread:
-                continue
-
-            opportunities.append(
-                {
-                    "symbol": sym,
-                    "min_exchange": min_ex,
-                    "max_exchange": max_ex,
-                    "min_rate": min_rate,
-                    "max_rate": max_rate,
-                    "spread": spread,
-                }
-            )
-
-        if not opportunities:
-            return None
-
-        opportunities.sort(key=lambda x: abs(x["spread"]), reverse=True)
-        return opportunities
-
-    def get_arbitrage_opportunities(self):
-        """Ценовой арбитраж по BTC через v3 /futures/market."""
-        url = f"{self.base_url_v3}/futures/market"
-        params = {"symbol": "BTC"}
-
-        try:
-            response = requests.get(
-                url, headers=self.headers_v3, params=params, timeout=10
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("success"):
-                    return self._calculate_arbitrage(data.get("data", []))
-
-            logger.warning("Coinglass v3 futures/market error: %s", response.text)
-            return None
-        except Exception as e:
-            logger.exception(f"Ошибка при запросе к Coinglass v3 futures/market: {e}")
-            return None
-
-    def _calculate_arbitrage(self, market_data):
-        opportunities = []
-
-        for coin_data in market_data:
-            symbol = coin_data.get("symbol", "")
-            exchanges = coin_data.get("exchangeName", [])
-            prices = coin_data.get("price", [])
-
-            if len(prices) >= 2:
-                try:
-                    prices_float = [float(p) for p in prices]
-                except Exception:
-                    continue
-
-                min_price = min(prices_float)
-                max_price = max(prices_float)
-
-                if min_price > 0:
-                    spread_percent = ((max_price - min_price) / min_price) * 100
-
-                    if spread_percent > 0.5:
-                        opportunities.append(
-                            {
-                                "symbol": symbol,
-                                "min_price": min_price,
-                                "max_price": max_price,
-                                "spread_percent": round(spread_percent, 2),
-                                "exchanges": exchanges,
-                            }
-                        )
-
-        return sorted(opportunities, key=lambda x: x["spread_percent"], reverse=True)
-
 
 class CryptoArbBot:
     def __init__(self):
         self.api = CoinglassAPI()
         self.application = Application.builder().token(TELEGRAM_TOKEN).build()
-        self.funding_cache: list[dict] = []
-        self.funding_cache_updated_at: datetime | None = None
+        self.funding_cache = []
+        self.funding_cache_updated_at = None
         self.setup_handlers()
 
     async def update_funding_cache(self, context: ContextTypes.DEFAULT_TYPE):
-        """Фоновое обновление кэша фандинга."""
         try:
             data = await asyncio.to_thread(self.api.get_funding_rates)
             if data:
                 self.funding_cache = data
                 self.funding_cache_updated_at = datetime.now(timezone.utc)
-                logger.info(
-                    "Кэш фандинга обновлён: %d записей", len(self.funding_cache)
-                )
+                logger.info("Кэш фандинга обновлён: %d записей", len(self.funding_cache))
             else:
                 logger.warning("Кэш фандинга: получены пустые данные от Coinglass")
         except Exception as e:
             logger.exception("Не удалось обновить кэш фандинга: %s", e)
 
-    def get_cached_funding(self, symbol: str | None = None):
-        """Вернуть данные из кэша, при необходимости отфильтрованные по монете."""
+    def get_filtered_funding(self, funding_type="all"):
         if not self.funding_cache:
             return None
 
-        if symbol:
-            su = symbol.upper()
-            return [
-                item
-                for item in self.funding_cache
-                if item.get("symbol", "").upper() == su
-            ]
-
-        return self.funding_cache
+        if funding_type == "negative":
+            filtered = [item for item in self.funding_cache if item.get("rate", 0) < 0]
+            return sorted(filtered, key=lambda x: x["rate"])
+        elif funding_type == "positive":
+            filtered = [item for item in self.funding_cache if item.get("rate", 0) > 0]
+            return sorted(filtered, key=lambda x: x["rate"], reverse=True)
+        else:
+            return self.funding_cache
 
     def setup_handlers(self):
         self.application.add_handler(CommandHandler("start", self.start))
-        self.application.add_handler(CommandHandler("funding", self.funding_rates))
-        self.application.add_handler(CommandHandler("arbitrage", self.arbitrage))
-        self.application.add_handler(CommandHandler("top_funding", self.top_funding))
-        self.application.add_handler(CommandHandler("arb_funding", self.arb_funding))
-        self.application.add_handler(CallbackQueryHandler(self.button_handler))
+        self.application.add_handler(CommandHandler("negative", self.show_negative))
+        self.application.add_handler(CommandHandler("positive", self.show_positive))
+        self.application.add_handler(CommandHandler("top10", self.show_top10))
+        self.application.add_handler(CommandHandler("arbitrage_bundles", self.show_arbitrage_bundles))
+        self.application.add_handler(CallbackQueryHandler(self.button_handler, pattern="^(page|nav):"))
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
-            [
-                InlineKeyboardButton("📊 Фандинг ставки", callback_data="funding"),
-                InlineKeyboardButton("💸 Арбитраж цены", callback_data="arbitrage"),
-            ],
-            [
-                InlineKeyboardButton("⚖️ Арбитраж фандинга", callback_data="arb_funding"),
-                InlineKeyboardButton("🚀 Топ фандинг", callback_data="top_funding"),
-            ],
+            [InlineKeyboardButton("🔴 Все отрицательные", callback_data="nav:negative")],
+            [InlineKeyboardButton("🟢 Все положительные", callback_data="nav:positive")],
+            [InlineKeyboardButton("🚀 Топ 10 лучших", callback_data="nav:top10")],
+            [InlineKeyboardButton("⚖️ Связки арбитража", callback_data="nav:arbitrage")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         welcome_text = (
-            "🤖 <b>Crypto Funding &amp; Arbitrage Bot</b>\n\n"
+            "🤖 <b>Crypto Funding & Arbitrage Bot</b>\n\n"
             "Доступные команды:\n"
-            "/funding - фандинг ставки по всем парам или /funding BTC\n"
-            "/arbitrage - ценовой арбитраж между биржами\n"
-            "/top_funding - топ высоких фандинг ставок\n"
-            "/arb_funding - арбитраж фандинга между биржами\n\n"
-            "Бот работает с полным списком монет и бирж через кэш Coinglass.\n"
+            "/negative - все отрицательные фандинги\n"
+            "/positive - все положительные фандинги\n"
+            "/top10 - топ 10 лучших фандингов\n"
+            "/arbitrage_bundles - связки арбитража\n\n"
             "Используйте кнопки ниже для быстрого доступа!"
         )
 
-        await update.message.reply_text(
-            welcome_text, reply_markup=reply_markup, parse_mode="HTML"
-        )
+        await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="HTML")
 
-    async def funding_rates(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать фандинг ставки (из кэша)"""
-        await update.message.reply_text("🔄 Получаю данные о фандинг ставках из кэша...")
+    async def show_negative(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self.show_funding_page(update, context, "negative", 1)
 
-        symbol = None
-        if context.args:
-            symbol = context.args[0].upper()
+    async def show_positive(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self.show_funding_page(update, context, "positive", 1)
 
-        funding_data = self.get_cached_funding(symbol)
-
-        if not funding_data:
-            await update.message.reply_text(
-                "⚠️ Данные по фандингу ещё не загружены или Coinglass не ответил.\n"
-                "Попробуй ещё раз через 20–30 секунд."
-            )
+    async def show_funding_page(self, update: Update, context: ContextTypes.DEFAULT_TYPE, funding_type: str, page: int):
+        if not self.funding_cache:
+            await update.message.reply_text("⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.")
             return
 
-        header = symbol if symbol else "всех монет"
-        response = f"📊 <b>Текущие фандинг ставки для {header}:</b>\n\n"
+        filtered_data = self.get_filtered_funding(funding_type)
+        if not filtered_data:
+            await update.message.reply_text("🤷‍♂️ Нет данных для отображения.")
+            return
 
-        # Если указан тикер (например /funding BTC) — показываем все биржи по этой монете
-        if symbol:
-            items_to_show = sorted(
-                funding_data,
-                key=lambda x: (x.get("marginType", ""), x.get("exchangeName", "")),
-            )
+        items_per_page = 20
+        total_pages = (len(filtered_data) + items_per_page - 1) // items_per_page
+        page = max(1, min(page, total_pages))
+        
+        start_idx = (page - 1) * items_per_page
+        end_idx = start_idx + items_per_page
+        page_data = filtered_data[start_idx:end_idx]
+
+        # Сохраняем состояние для пагинации
+        context.user_data.update({
+            'current_page': page,
+            'total_pages': total_pages,
+            'current_data_type': funding_type,
+            'current_data': filtered_data
+        })
+
+        # Создаем сообщение
+        title = "🔴 Отрицательные фандинги" if funding_type == "negative" else "🟢 Положительные фандинги"
+        response = f"<b>{title}</b>\n"
+        response += f"Страница {page}/{total_pages}\n\n"
+
+        for i, item in enumerate(page_data, start=start_idx + 1):
+            symbol = item.get("symbol", "")
+            exchange = item.get("exchangeName", "")
+            rate = item.get("rate", 0) * 100
+            interval = item.get("interval", "?")
+            
+            response += f"{i}. <b>{symbol}</b>\n"
+            response += f"   Биржа: {exchange}\n"
+            response += f"   Ставка: {rate:.4f}% | {interval}ч\n\n"
+
+        # Создаем клавиатуру пагинации
+        keyboard = []
+        if total_pages > 1:
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(InlineKeyboardButton("◀ Назад", callback_data=f"page:{funding_type}:{page-1}"))
+            
+            nav_buttons.append(InlineKeyboardButton(f"[{page}/{total_pages}]", callback_data="page:info"))
+            
+            if page < total_pages:
+                nav_buttons.append(InlineKeyboardButton("Вперед ▶", callback_data=f"page:{funding_type}:{page+1}"))
+            
+            keyboard.append(nav_buttons)
+
+        keyboard.append([InlineKeyboardButton("📋 Главное меню", callback_data="nav:main")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        if update.callback_query:
+            await update.callback_query.edit_message_text(response, reply_markup=reply_markup, parse_mode="HTML")
         else:
-            # Без тикера — топ по абсолютному значению ставки (чтобы не заспамить чат)
-            items_to_show = sorted(
-                funding_data,
-                key=lambda x: abs(
-                    float(x.get("uMarginList", [{}])[0].get("rate", 0) or 0)
-                ),
-                reverse=True,
-            )[:15]
+            await update.message.reply_text(response, reply_markup=reply_markup, parse_mode="HTML")
 
-        for item in items_to_show:
-            symbol_item = item.get("symbol", "")
-            rate_list = item.get("uMarginList", [{}])
-            rate = rate_list[0].get("rate", 0) if rate_list else 0
+    async def show_top10(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.funding_cache:
+            await update.message.reply_text("⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.")
+            return
+
+        # Получаем топ 10 положительных и отрицательных
+        positive_data = self.get_filtered_funding("positive")[:10]
+        negative_data = self.get_filtered_funding("negative")[:10]
+
+        response = "<b>🚀 Топ 10 лучших фандингов</b>\n\n"
+        
+        response += "<b>🟢 Топ 10 положительных:</b>\n"
+        for i, item in enumerate(positive_data, 1):
+            symbol = item.get("symbol", "")
             exchange = item.get("exchangeName", "")
-            margin_type = item.get("marginType", "USDT")
+            rate = item.get("rate", 0) * 100
             interval = item.get("interval", "?")
+            response += f"{i}. <b>{symbol}</b> - {rate:.4f}% ({exchange}, {interval}ч)\n"
 
-            try:
-                rate_percent = round(float(rate) * 100, 4)
-            except Exception:
-                rate_percent = 0
+        response += "\n<b>🔴 Топ 10 отрицательных:</b>\n"
+        for i, item in enumerate(negative_data, 1):
+            symbol = item.get("symbol", "")
+            exchange = item.get("exchangeName", "")
+            rate = item.get("rate", 0) * 100
+            interval = item.get("interval", "?")
+            response += f"{i}. <b>{symbol}</b> - {rate:.4f}% ({exchange}, {interval}ч)\n"
 
-            if rate_percent > 0:
-                emoji = "🟢"
-            elif rate_percent < 0:
-                emoji = "🔴"
-            else:
-                emoji = "⚪️"
+        keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav:main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
-            response += f"{emoji} <b>{symbol_item}</b>\n"
-            response += f"   Биржа: {exchange} ({margin_type})\n"
-            response += f"   Ставка: {rate_percent}% за {interval}ч\n\n"
+        await update.message.reply_text(response, reply_markup=reply_markup, parse_mode="HTML")
 
-        await update.message.reply_text(response, parse_mode="HTML")
-
-    async def arbitrage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать арбитражные возможности по ЦЕНЕ (BTC)"""
-        await update.message.reply_text("🔍 Ищу арбитражные возможности по цене...")
-
-        arb_opportunities = self.api.get_arbitrage_opportunities()
-
-        if not arb_opportunities:
-            await update.message.reply_text(
-                "🤷‍♂️ Арбитражные ценовые возможности не найдены или ошибка API"
-            )
+    async def show_arbitrage_bundles(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self.funding_cache:
+            await update.message.reply_text("⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.")
             return
 
-        response = "💸 <b>Арбитражные возможности по цене (BTC):</b>\n\n"
+        # Группируем данные по символам
+        symbol_data = {}
+        for item in self.funding_cache:
+            symbol = item.get("symbol", "")
+            if symbol not in symbol_data:
+                symbol_data[symbol] = []
+            
+            symbol_data[symbol].append({
+                'exchange': item.get("exchangeName", ""),
+                'rate': item.get("rate", 0),
+                'interval': item.get("interval", "?")
+            })
 
-        for opp in arb_opportunities[:10]:
-            response += f"🎯 <b>{opp['symbol']}</b>\n"
-            response += f"   Спред: {opp['spread_percent']}%\n"
-            response += f"   Мин: ${opp['min_price']:.2f}\n"
-            response += f"   Макс: ${opp['max_price']:.2f}\n\n"
-
-        await update.message.reply_text(response, parse_mode="HTML")
-
-    async def top_funding(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Топ высоких фандинг ставок (из кэша)"""
-        await update.message.reply_text("📈 Ищу самые высокие фандинг ставки в кэше...")
-
-        funding_data = self.get_cached_funding()
-
-        if not funding_data:
-            await update.message.reply_text(
-                "⚠️ Данные по фандингу ещё не загружены или Coinglass не ответил.\n"
-                "Попробуй ещё раз через 20–30 секунд."
-            )
-            return
-
-        filtered_data = []
-        for item in funding_data:
-            rate_list = item.get("uMarginList", [{}])
-            rate = rate_list[0].get("rate", 0) if rate_list else 0
-            try:
-                r = float(rate)
-            except Exception:
+        # Ищем арбитражные возможности
+        opportunities = []
+        for symbol, exchanges in symbol_data.items():
+            if len(exchanges) < 2:
                 continue
-            if r != 0:
-                filtered_data.append(item)
 
-        sorted_data = sorted(
-            filtered_data,
-            key=lambda x: abs(
-                float(x.get("uMarginList", [{}])[0].get("rate", 0) or 0)
-            ),
-            reverse=True,
-        )
+            # Находим мин и макс ставки
+            min_item = min(exchanges, key=lambda x: x['rate'])
+            max_item = max(exchanges, key=lambda x: x['rate'])
+            
+            spread = max_item['rate'] - min_item['rate']
+            if abs(spread) < 0.0005:  # Минимальный спред 0.05%
+                continue
 
-        response = "🚀 <b>Топ высоких фандинг ставок:</b>\n\n"
+            # Проверяем время выплат
+            time_warning = ""
+            if min_item['interval'] != max_item['interval']:
+                time_warning = " ⚠️ РАЗНОЕ ВРЕМЯ ВЫПЛАТ!"
 
-        for i, item in enumerate(sorted_data[:10]):
-            symbol_item = item.get("symbol", "")
-            rate_list = item.get("uMarginList", [{}])
-            rate = rate_list[0].get("rate", 0) if rate_list else 0
-            exchange = item.get("exchangeName", "")
-            margin_type = item.get("marginType", "USDT")
-            interval = item.get("interval", "?")
+            opportunities.append({
+                'symbol': symbol,
+                'min_exchange': min_item['exchange'],
+                'max_exchange': max_item['exchange'],
+                'min_rate': min_item['rate'],
+                'max_rate': max_item['rate'],
+                'spread': spread,
+                'time_warning': time_warning
+            })
 
-            try:
-                rate_percent = round(float(rate) * 100, 4)
-            except Exception:
-                rate_percent = 0
+        # Сортируем по спреду
+        opportunities.sort(key=lambda x: abs(x['spread']), reverse=True)
 
-            emoji = "📈" if rate_percent > 0 else "📉"
-
-            response += f"{i+1}. {emoji} <b>{symbol_item}</b>\n"
-            response += f"   Биржа: {exchange} ({margin_type})\n"
-            response += f"   Ставка: {rate_percent}% за {interval}ч\n\n"
-
-        await update.message.reply_text(response, parse_mode="HTML")
-
-    async def arb_funding(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Арбитраж фандинга между биржами (из кэша)"""
-        await update.message.reply_text("⚖️ Ищу арбитраж фандинга между биржами...")
-
-        symbol = None
-        if context.args:
-            symbol = context.args[0].upper()
-
-        items = self.get_cached_funding(symbol)
-
-        if not items:
-            await update.message.reply_text(
-                "⚠️ Данные по фандингу ещё не загружены или Coinglass не ответил.\n"
-                "Попробуй ещё раз через 20–30 секунд."
-            )
-            return
-
-        opportunities = self.api.calculate_funding_arbitrage_from_items(
-            items, symbol=symbol, min_spread=0.0005
-        )
-
+        response = "<b>⚖️ Связки арбитража</b>\n\n"
+        
         if not opportunities:
-            await update.message.reply_text(
-                "🤷‍♂️ Арбитраж фандинга не найден для выбранных монет."
-            )
-            return
+            response += "🤷‍♂️ Арбитражные возможности не найдены"
+        else:
+            for opp in opportunities[:15]:  # Показываем топ 15
+                response += f"<b>{opp['symbol']}</b>\n"
+                response += f"📉 {opp['min_exchange']}: {opp['min_rate']*100:.4f}%\n"
+                response += f"📈 {opp['max_exchange']}: {opp['max_rate']*100:.4f}%\n"
+                response += f"💰 Спред: {opp['spread']*100:.4f}%{opp['time_warning']}\n\n"
 
-        header = (
-            f"⚖️ <b>Арбитраж фандинга для {symbol}:</b>\n\n"
-            if symbol
-            else "⚖️ <b>Арбитраж фандинга (USDT-маржа по всем монетам):</b>\n\n"
-        )
-        response = header
+        keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav:main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
-        for opp in opportunities[:10]:
-            sym = opp["symbol"]
-            min_ex = opp["min_exchange"]
-            max_ex = opp["max_exchange"]
-            min_rate = opp["min_rate"] * 100
-            max_rate = opp["max_rate"] * 100
-            spread = opp["spread"] * 100
-
-            response += f"🎯 <b>{sym}</b>\n"
-            response += f"   Мин. ставка: {min_ex} → {min_rate:.4f}%\n"
-            response += f"   Макс. ставка: {max_ex} → {max_rate:.4f}%\n"
-            response += f"   Спред по фандингу: {spread:.4f}%\n\n"
-
-        response += (
-            "💡 Идея: шортить там, где ставка выше, и лонговать там, где ниже/отрицательная, "
-            "чтобы зарабатывать на разнице funding. Не забывай про комиссии и риск бирж."
-        )
-
-        await update.message.reply_text(response, parse_mode="HTML")
+        await update.message.reply_text(response, reply_markup=reply_markup, parse_mode="HTML")
 
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
 
-        if query.data == "funding":
-            await self.funding_rates_callback(query)
-        elif query.data == "arbitrage":
-            await self.arbitrage_callback(query)
-        elif query.data == "top_funding":
-            await self.top_funding_callback(query)
-        elif query.data == "arb_funding":
-            await self.arb_funding_callback(query)
+        data = query.data
+        if data.startswith("page:"):
+            parts = data.split(":")
+            if len(parts) == 3:
+                funding_type = parts[1]
+                page = int(parts[2])
+                await self.show_funding_page(update, context, funding_type, page)
+        elif data.startswith("nav:"):
+            nav_type = data.split(":")[1]
+            if nav_type == "main":
+                await self.show_main_menu(update, context)
+            elif nav_type == "negative":
+                await self.show_funding_page(update, context, "negative", 1)
+            elif nav_type == "positive":
+                await self.show_funding_page(update, context, "positive", 1)
+            elif nav_type == "top10":
+                await self.show_top10(update, context)
+            elif nav_type == "arbitrage":
+                await self.show_arbitrage_bundles(update, context)
 
-    async def funding_rates_callback(self, query):
-        await query.edit_message_text("🔄 Получаю данные о фандинг ставках из кэша...")
-
-        funding_data = self.get_cached_funding()
-
-        if not funding_data:
-            await query.edit_message_text(
-                "⚠️ Данные по фандингу ещё не загружены или Coinglass не ответил.\n"
-                "Попробуй ещё раз через 20–30 секунд."
-            )
-            return
-
-        response = "📊 <b>Текущие фандинг ставки (топ по абсолютному значению):</b>\n\n"
-
-        filtered = sorted(
-            funding_data,
-            key=lambda x: abs(
-                float(x.get("uMarginList", [{}])[0].get("rate", 0) or 0)
-            ),
-            reverse=True,
-        )
-
-        for item in filtered[:12]:
-            symbol_item = item.get("symbol", "")
-            rate_list = item.get("uMarginList", [{}])
-            rate = rate_list[0].get("rate", 0) if rate_list else 0
-            exchange = item.get("exchangeName", "")
-            margin_type = item.get("marginType", "USDT")
-            interval = item.get("interval", "?")
-
-            try:
-                rate_percent = round(float(rate) * 100, 4)
-            except Exception:
-                rate_percent = 0
-
-            if rate_percent > 0:
-                emoji = "🟢"
-            elif rate_percent < 0:
-                emoji = "🔴"
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text.strip()
+        
+        # Проверяем, является ли сообщение номером страницы
+        if text.isdigit():
+            page_num = int(text)
+            user_data = context.user_data
+            
+            if 'current_data_type' in user_data and 'total_pages' in user_data:
+                total_pages = user_data['total_pages']
+                funding_type = user_data['current_data_type']
+                
+                if 1 <= page_num <= total_pages:
+                    await self.show_funding_page(update, context, funding_type, page_num)
+                else:
+                    await update.message.reply_text(f"⚠️ Страница должна быть от 1 до {total_pages}")
             else:
-                emoji = "⚪️"
+                await update.message.reply_text("⚠️ Сначала выберите раздел для навигации")
+        else:
+            await update.message.reply_text("ℹ️ Для быстрого перехода введите номер страницы")
 
-            response += f"{emoji} <b>{symbol_item}</b>\n"
-            response += f"   Биржа: {exchange} ({margin_type})\n"
-            response += f"   Ставка: {rate_percent}% за {interval}ч\n\n"
-
-        await query.edit_message_text(response, parse_mode="HTML")
-
-    async def arbitrage_callback(self, query):
-        await query.edit_message_text("🔍 Ищу арбитражные возможности по цене...")
-
-        arb_opportunities = self.api.get_arbitrage_opportunities()
-
-        if not arb_opportunities:
-            await query.edit_message_text(
-                "🤷‍♂️ Арбитражные возможности не найдены или ошибка API"
-            )
-            return
-
-        response = "💸 <b>Арбитражные возможности по цене (BTC):</b>\n\n"
-
-        for opp in arb_opportunities[:8]:
-            response += f"🎯 <b>{opp['symbol']}</b>\n"
-            response += f"   Спред: {opp['spread_percent']}%\n"
-            response += f"   Мин: ${opp['min_price']:.2f}\n"
-            response += f"   Макс: ${opp['max_price']:.2f}\n\n"
-
-        await query.edit_message_text(response, parse_mode="HTML")
-
-    async def top_funding_callback(self, query):
-        await query.edit_message_text("📈 Ищу самые высокие фандинг ставки в кэше...")
-
-        funding_data = self.get_cached_funding()
-
-        if not funding_data:
-            await query.edit_message_text(
-                "⚠️ Данные по фандингу ещё не загружены или Coinglass не ответил.\n"
-                "Попробуй ещё раз через 20–30 секунд."
-            )
-            return
-
-        filtered_data = []
-        for item in funding_data:
-            rate_list = item.get("uMarginList", [{}])
-            rate = rate_list[0].get("rate", 0) if rate_list else 0
-            try:
-                r = float(rate)
-            except Exception:
-                continue
-            if r != 0:
-                filtered_data.append(item)
-
-        sorted_data = sorted(
-            filtered_data,
-            key=lambda x: abs(
-                float(x.get("uMarginList", [{}])[0].get("rate", 0) or 0)
-            ),
-            reverse=True,
-        )
-
-        response = "🚀 <b>Топ высоких фандинг ставок:</b>\n\n"
-
-        for i, item in enumerate(sorted_data[:8]):
-            symbol_item = item.get("symbol", "")
-            rate_list = item.get("uMarginList", [{}])
-            rate = rate_list[0].get("rate", 0) if rate_list else 0
-            exchange = item.get("exchangeName", "")
-            margin_type = item.get("marginType", "USDT")
-            interval = item.get("interval", "?")
-
-            try:
-                rate_percent = round(float(rate) * 100, 4)
-            except Exception:
-                rate_percent = 0
-
-            emoji = "📈" if rate_percent > 0 else "📉"
-
-            response += f"{i+1}. {emoji} <b>{symbol_item}</b>\n"
-            response += f"   Биржа: {exchange} ({margin_type})\n"
-            response += f"   Ставка: {rate_percent}% за {interval}ч\n\n"
-
-        await query.edit_message_text(response, parse_mode="HTML")
-
-    async def arb_funding_callback(self, query):
-        await query.edit_message_text("⚖️ Ищу арбитраж фандинга между биржами...")
-
-        items = self.get_cached_funding()
-
-        if not items:
-            await query.edit_message_text(
-                "⚠️ Данные по фандингу ещё не загружены или Coinglass не ответил.\n"
-                "Попробуй ещё раз через 20–30 секунд."
-            )
-            return
-
-        opportunities = self.api.calculate_funding_arbitrage_from_items(
-            items, symbol=None, min_spread=0.0005
-        )
-
-        if not opportunities:
-            await query.edit_message_text(
-                "🤷‍♂️ Арбитраж фандинга не найден для текущих данных."
-            )
-            return
-
-        response = "⚖️ <b>Арбитраж фандинга (USDT-маржа по всем монетам):</b>\n\n"
-
-        for opp in opportunities[:8]:
-            sym = opp["symbol"]
-            min_ex = opp["min_exchange"]
-            max_ex = opp["max_exchange"]
-            min_rate = opp["min_rate"] * 100
-            max_rate = opp["max_rate"] * 100
-            spread = opp["spread"] * 100
-
-            response += f"🎯 <b>{sym}</b>\n"
-            response += f"   Мин. ставка: {min_ex} → {min_rate:.4f}%\n"
-            response += f"   Макс. ставка: {max_ex} → {max_rate:.4f}%\n"
-            response += f"   Спред по фандингу: {spread:.4f}%\n\n"
-
-        response += (
-            "💡 Идея: использовать разницу funding для квази-маркет-нейтральных стратегий.\n"
-            "Всегда учитывай комиссии и риски конкретных бирж."
-        )
-
-        await query.edit_message_text(response, parse_mode="HTML")
+    async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        keyboard = [
+            [InlineKeyboardButton("🔴 Все отрицательные", callback_data="nav:negative")],
+            [InlineKeyboardButton("🟢 Все положительные", callback_data="nav:positive")],
+            [InlineKeyboardButton("🚀 Топ 10 лучших", callback_data="nav:top10")],
+            [InlineKeyboardButton("⚖️ Связки арбитража", callback_data="nav:arbitrage")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        text = "📋 <b>Главное меню</b>\nВыберите раздел:"
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+        else:
+            await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
 
     def run(self):
         print("🤖 Бот запущен...")
-
-        # фоновое обновление кэша раз в 60 секунд
+        # Фоновое обновление кэша каждые 30 секунд
         self.application.job_queue.run_repeating(
             self.update_funding_cache,
-            interval=60,
+            interval=30,
             first=0,
         )
-
         self.application.run_polling()
-
 
 if __name__ == "__main__":
     bot = CryptoArbBot()
