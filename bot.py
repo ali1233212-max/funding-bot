@@ -8,8 +8,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # Токены (ЗАМЕНИ НА СВОИ)
-TELEGRAM_TOKEN = "PUT_TELEGRAM_TOKEN_HERE"
-COINGLASS_TOKEN = "PUT_COINGLASS_TOKEN_HERE"
+TELEGRAM_TOKEN = "8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0"
+COINGLASS_TOKEN = "2d73a05799f64daab80329868a5264ea"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
