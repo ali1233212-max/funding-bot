@@ -27,7 +27,7 @@ class CoinglassAPI:
             "coinglassSecret": COINGLASS_TOKEN,
         }
         self.headers_v4 = {
-            "accept": "application/json", 
+            "accept": "application/json",
             "CG-API-KEY": COINGLASS_TOKEN,
         }
 
@@ -38,7 +38,7 @@ class CoinglassAPI:
         url = f"{self.base_url_v4}/futures/funding-rate/exchange-list"
         MAX_RETRIES = 3
         TIMEOUT = 60
-
+        
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 resp = requests.get(
@@ -52,15 +52,15 @@ class CoinglassAPI:
                 if data.get("code") != "0":
                     logger.warning("Coinglass v4 funding-rate/exchange-list error: %s", data)
                     return None
-
+                
                 entries = data.get("data", [])
                 result = []
-
+                
                 for entry in entries:
                     sym = entry.get("symbol", "")
                     stable_list = entry.get("stablecoin_margin_list") or []
                     token_list = entry.get("token_margin_list") or []
-
+                    
                     # USDT маржа
                     for row in stable_list:
                         try:
@@ -77,7 +77,7 @@ class CoinglassAPI:
                             "nextFundingTime": row.get("next_funding_time", ""),
                         }
                         result.append(item)
-
+                    
                     # COIN маржа
                     for row in token_list:
                         try:
@@ -89,15 +89,15 @@ class CoinglassAPI:
                             "symbol": sym,
                             "exchangeName": row.get("exchange", ""),
                             "rate": rate,
-                            "marginType": "COIN", 
+                            "marginType": "COIN",
                             "interval": row.get("funding_rate_interval", "?"),
                             "nextFundingTime": row.get("next_funding_time", ""),
                         }
                         result.append(item)
-
+                
                 logger.info("Coinglass v4 funding-rate: получили %d записей", len(result))
                 return result
-
+                
             except requests.exceptions.ReadTimeout:
                 logger.warning("Таймаут при запросе к Coinglass v4 (попытка %d/%d)", attempt, MAX_RETRIES)
                 if attempt == MAX_RETRIES:
@@ -160,7 +160,7 @@ class CoinglassAPI:
                             "spread_percent": round(spread_percent, 2),
                             "exchanges": exchanges,
                         })
-
+        
         return sorted(opportunities, key=lambda x: x["spread_percent"], reverse=True)
 
     def calculate_funding_arbitrage_from_items(self, funding_items, symbol=None, min_spread=0.0005):
@@ -169,43 +169,44 @@ class CoinglassAPI:
         """
         if not funding_items:
             return None
-
+            
         by_symbol = {}
         for item in funding_items:
             sym = item.get("symbol", "")
             if not sym:
                 continue
+                
             if symbol and sym.upper() != symbol.upper():
                 continue
-
+                
             margin_type = item.get("marginType", "USDT")
             if margin_type != "USDT":
                 continue
-
+                
             rate = item.get("rate", 0)
             exchange = item.get("exchangeName", "")
             if not exchange:
                 continue
-
+                
             try:
                 r = float(rate)
             except (TypeError, ValueError):
                 continue
-
+                
             by_symbol.setdefault(sym, []).append((exchange, r))
-
+            
         opportunities = []
         for sym, ex_rates in by_symbol.items():
             if len(ex_rates) < 2:
                 continue
-
+                
             min_ex, min_rate = min(ex_rates, key=lambda x: x[1])
             max_ex, max_rate = max(ex_rates, key=lambda x: x[1])
             spread = max_rate - min_rate
-
+            
             if abs(spread) < min_spread:
                 continue
-
+                
             opportunities.append({
                 "symbol": sym,
                 "min_exchange": min_ex,
@@ -214,10 +215,10 @@ class CoinglassAPI:
                 "max_rate": max_rate,
                 "spread": spread,
             })
-
+            
         if not opportunities:
             return None
-
+            
         opportunities.sort(key=lambda x: abs(x["spread"]), reverse=True)
         return opportunities
 
@@ -253,13 +254,14 @@ class CryptoArbBot:
         """
         if not self.funding_cache:
             return None
-
+            
         if symbol:
             symbol_upper = symbol.upper()
             return [
                 item for item in self.funding_cache
                 if item.get("symbol", "").upper() == symbol_upper
             ]
+            
         return self.funding_cache
 
     def get_filtered_funding(self, funding_type="all"):
@@ -269,7 +271,7 @@ class CryptoArbBot:
         data = self.get_cached_funding()
         if not data:
             return None
-
+            
         if funding_type == "negative":
             filtered = [item for item in data if item.get("rate", 0) < 0]
             return sorted(filtered, key=lambda x: x["rate"])  # от -1000% до -0.1%
@@ -285,13 +287,13 @@ class CryptoArbBot:
         """
         if not self.funding_cache:
             return None
-        
+            
         exchanges = set()
         for item in self.funding_cache:
             exchange = item.get("exchangeName", "")
             if exchange:
                 exchanges.add(exchange)
-        
+                
         return sorted(list(exchanges))
 
     def setup_handlers(self):
@@ -299,7 +301,7 @@ class CryptoArbBot:
         handlers = [
             CommandHandler("start", self.start),
             CommandHandler("negative", self.show_negative),
-            CommandHandler("positive", self.show_positive), 
+            CommandHandler("positive", self.show_positive),
             CommandHandler("top10", self.show_top10),
             CommandHandler("arbitrage_bundles", self.show_arbitrage_bundles),
             CommandHandler("price_arbitrage", self.show_price_arbitrage),
@@ -340,12 +342,13 @@ class CryptoArbBot:
             [InlineKeyboardButton("💰 Ценовой арбитраж", callback_data="nav_price_arb")],
             [InlineKeyboardButton("📊 Статус бота", callback_data="nav_status")],
         ]
+        
         reply_markup = InlineKeyboardMarkup(keyboard)
-
+        
         welcome_text = (
             "🤖 <b>Crypto Funding & Arbitrage Bot</b>\n\n"
             "📈 <b>Доступные команды:</b>\n"
-            "/negative - все отрицательные фандинги\n" 
+            "/negative - все отрицательные фандинги\n"
             "/positive - все положительные фандинги\n"
             "/top10 - топ 10 положительных и отрицательных\n"
             "/arbitrage_bundles - связки арбитража фандинга\n"
@@ -359,7 +362,7 @@ class CryptoArbBot:
             "• Кеширование каждые 30 секунд\n\n"
             "Используйте кнопки ниже для быстрого доступа!"
         )
-
+        
         await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="HTML")
 
     async def show_negative(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -372,30 +375,30 @@ class CryptoArbBot:
 
     async def show_funding_page(self, update: Update, context: ContextTypes.DEFAULT_TYPE, funding_type: str, page: int):
         """Показать страницу с фандингами"""
+        # Определяем метод отправки в зависимости от типа update
+        if update.callback_query:
+            send_method = update.callback_query.edit_message_text
+        else:
+            send_method = update.message.reply_text
+
         # Проверяем кэш
         if not self.funding_cache:
             error_msg = (
                 "⚠️ <b>Данные ещё не загружены</b>\n\n"
                 "Кэш фандинга пуст. Это может быть потому что:\n"
-                "• Бот только что запустился\n"  
+                "• Бот только что запустился\n"
                 "• Проблемы с API Coinglass\n"
                 "• Превышены лимиты запросов\n\n"
                 "Попробуйте через 30 секунд..."
             )
-            if hasattr(update, 'callback_query') and update.callback_query:
-                await update.callback_query.edit_message_text(error_msg, parse_mode="HTML")
-            else:
-                await update.message.reply_text(error_msg, parse_mode="HTML")
+            await send_method(error_msg, parse_mode="HTML")
             return
 
         # Получаем и фильтруем данные
         filtered_data = self.get_filtered_funding(funding_type)
         if not filtered_data:
             no_data_msg = "🤷‍♂️ <b>Нет данных для отображения</b>\n\nПопробуйте другой раздел."
-            if hasattr(update, 'callback_query') and update.callback_query:
-                await update.callback_query.edit_message_text(no_data_msg, parse_mode="HTML")
-            else:
-                await update.message.reply_text(no_data_msg, parse_mode="HTML")
+            await send_method(no_data_msg, parse_mode="HTML")
             return
 
         # Пагинация
@@ -403,7 +406,6 @@ class CryptoArbBot:
         total_items = len(filtered_data)
         total_pages = (total_items + items_per_page - 1) // items_per_page
         page = max(1, min(page, total_pages))
-        
         start_idx = (page - 1) * items_per_page
         end_idx = start_idx + items_per_page
         page_data = filtered_data[start_idx:end_idx]
@@ -419,9 +421,8 @@ class CryptoArbBot:
         # Формируем сообщение
         title_map = {
             "negative": "🔴 Отрицательные фандинги",
-            "positive": "🟢 Положительные фандинги" 
+            "positive": "🟢 Положительные фандинги"
         }
-        
         response = f"<b>{title_map[funding_type]}</b>\n"
         response += f"📄 Страница {page}/{total_pages} | Всего записей: {total_items}\n\n"
 
@@ -431,13 +432,12 @@ class CryptoArbBot:
             rate = item.get("rate", 0) * 100
             interval = item.get("interval", "?")
             margin_type = item.get("marginType", "USDT")
-            
+
             # Эмодзи для визуализации
             emoji = "🔴" if funding_type == "negative" else "🟢"
-            
             response += f"{emoji} <b>{symbol}</b>\n"
-            response += f"   🏛️ {exchange} ({margin_type})\n"
-            response += f"   💰 {rate:+.4f}% | ⏰ {interval}ч\n\n"
+            response += f" 🏛️ {exchange} ({margin_type})\n"
+            response += f" 💰 {rate:+.4f}% | ⏰ {interval}ч\n\n"
 
         # Клавиатура пагинации
         keyboard = []
@@ -445,12 +445,9 @@ class CryptoArbBot:
             nav_buttons = []
             if page > 1:
                 nav_buttons.append(InlineKeyboardButton("◀ Назад", callback_data=f"page_{funding_type}_{page-1}"))
-            
             nav_buttons.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="page_info"))
-            
             if page < total_pages:
                 nav_buttons.append(InlineKeyboardButton("Вперед ▶", callback_data=f"page_{funding_type}_{page+1}"))
-            
             keyboard.append(nav_buttons)
 
         # Кнопки быстрой навигации
@@ -464,33 +461,33 @@ class CryptoArbBot:
                 keyboard.append(quick_nav)
 
         keyboard.append([InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")])
+
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         # Отправляем сообщение
         try:
-            if hasattr(update, 'callback_query') and update.callback_query:
-                await update.callback_query.edit_message_text(response, reply_markup=reply_markup, parse_mode="HTML")
-            else:
-                await update.message.reply_text(response, reply_markup=reply_markup, parse_mode="HTML")
+            await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
         except Exception as e:
             logger.error("Ошибка при отправке сообщения: %s", e)
             error_msg = "❌ <b>Ошибка при отображении данных</b>\nПопробуйте еще раз."
-            if hasattr(update, 'callback_query') and update.callback_query:
-                await update.callback_query.edit_message_text(error_msg, parse_mode="HTML")
-            else:
-                await update.message.reply_text(error_msg, parse_mode="HTML")
+            await send_method(error_msg, parse_mode="HTML")
 
     async def show_top10(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Топ 10 положительных и отрицательных фандингов"""
+        # Определяем метод отправки в зависимости от типа update
+        if update.callback_query:
+            send_method = update.callback_query.edit_message_text
+        else:
+            send_method = update.message.reply_text
+
         if not self.funding_cache:
-            await update.message.reply_text("⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.")
+            await send_method("⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.")
             return
 
         positive_data = self.get_filtered_funding("positive")[:10]
         negative_data = self.get_filtered_funding("negative")[:10]
 
         response = "<b>🚀 Топ 10 лучших фандингов</b>\n\n"
-        
         response += "<b>🟢 Топ 10 положительных:</b>\n"
         for i, item in enumerate(positive_data, 1):
             symbol = item.get("symbol", "")
@@ -515,12 +512,18 @@ class CryptoArbBot:
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await update.message.reply_text(response, reply_markup=reply_markup, parse_mode="HTML")
+        await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
 
     async def show_arbitrage_bundles(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Арбитражные связки с проверкой времени выплат"""
+        # Определяем метод отправки в зависимости от типа update
+        if update.callback_query:
+            send_method = update.callback_query.edit_message_text
+        else:
+            send_method = update.message.reply_text
+
         if not self.funding_cache:
-            await update.message.reply_text("⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.")
+            await send_method("⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.")
             return
 
         # Группируем по символам и биржам
@@ -529,7 +532,6 @@ class CryptoArbBot:
             symbol = item.get("symbol", "")
             if symbol not in symbol_data:
                 symbol_data[symbol] = []
-            
             symbol_data[symbol].append({
                 'exchange': item.get("exchangeName", ""),
                 'rate': item.get("rate", 0),
@@ -551,8 +553,8 @@ class CryptoArbBot:
             # Находим мин и макс ставки
             min_item = min(usdt_exchanges, key=lambda x: x['rate'])
             max_item = max(usdt_exchanges, key=lambda x: x['rate'])
-            
             spread = max_item['rate'] - min_item['rate']
+
             if abs(spread) < 0.0005:  # Минимальный спред 0.05%
                 continue
 
@@ -577,7 +579,6 @@ class CryptoArbBot:
         opportunities.sort(key=lambda x: abs(x['spread']), reverse=True)
 
         response = "<b>⚖️ Связки арбитража фандинга</b>\n\n"
-        
         if not opportunities:
             response += "🤷‍♂️ <b>Арбитражные возможности не найдены</b>\n\n"
             response += "Это может быть потому что:\n"
@@ -586,27 +587,32 @@ class CryptoArbBot:
             response += "• Рынок в состоянии равновесия"
         else:
             response += f"📊 Найдено возможностей: {len(opportunities)}\n\n"
-            
             for opp in opportunities[:15]:
                 response += f"🎯 <b>{opp['symbol']}</b>{opp['time_warning']}\n"
-                response += f"   📉 {opp['min_exchange']}: {opp['min_rate']*100:+.4f}% ({opp['min_interval']}ч)\n"
-                response += f"   📈 {opp['max_exchange']}: {opp['max_rate']*100:+.4f}% ({opp['max_interval']}ч)\n"
-                response += f"   💰 Спред: {opp['spread']*100:.4f}%\n\n"
+                response += f" 📉 {opp['min_exchange']}: {opp['min_rate']*100:+.4f}% ({opp['min_interval']}ч)\n"
+                response += f" 📈 {opp['max_exchange']}: {opp['max_rate']*100:+.4f}% ({opp['max_interval']}ч)\n"
+                response += f" 💰 Спред: {opp['spread']*100:.4f}%\n\n"
 
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await update.message.reply_text(response, reply_markup=reply_markup, parse_mode="HTML")
+        await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
 
     async def show_exchanges(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать все доступные биржи"""
+        # Определяем метод отправки в зависимости от типа update
+        if update.callback_query:
+            send_method = update.callback_query.edit_message_text
+        else:
+            send_method = update.message.reply_text
+
         if not self.funding_cache:
-            await update.message.reply_text("⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.")
+            await send_method("⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.")
             return
 
         exchanges = self.get_all_exchanges()
         if not exchanges:
-            await update.message.reply_text("🤷‍♂️ Не удалось получить список бирж.")
+            await send_method("🤷‍♂️ Не удалось получить список бирж.")
             return
 
         response = "<b>🏛️ Все доступные биржи</b>\n\n"
@@ -621,7 +627,7 @@ class CryptoArbBot:
         # Добавляем статистику по данным
         unique_symbols = len(set(item.get('symbol', '') for item in self.funding_cache))
         total_records = len(self.funding_cache)
-        
+
         response += f"\n📈 <b>Статистика данных:</b>\n"
         response += f"• Всего записей: {total_records}\n"
         response += f"• Уникальных пар: {unique_symbols}\n"
@@ -634,41 +640,51 @@ class CryptoArbBot:
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await update.message.reply_text(response, reply_markup=reply_markup, parse_mode="HTML")
+        await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
 
     async def show_price_arbitrage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Ценовой арбитраж (дополнительная функция)"""
-        await update.message.reply_text("🔍 Ищу арбитражные возможности по цене...")
-        
+        # Определяем метод отправки в зависимости от типа update
+        if update.callback_query:
+            send_method = update.callback_query.edit_message_text
+        else:
+            send_method = update.message.reply_text
+
+        await send_method("🔍 Ищу арбитражные возможности по цене...")
+
         opportunities = self.api.get_arbitrage_opportunities()
-        
         if not opportunities:
-            await update.message.reply_text("🤷‍♂️ Арбитражные возможности по цене не найдены")
+            await send_method("🤷‍♂️ Арбитражные возможности по цене не найдены")
             return
 
         response = "💸 <b>Арбитражные возможности по цене (BTC):</b>\n\n"
         for opp in opportunities[:10]:
             response += f"🎯 <b>{opp['symbol']}</b>\n"
-            response += f"   📊 Спред: {opp['spread_percent']}%\n"
-            response += f"   💰 Мин: ${opp['min_price']:.2f}\n"
-            response += f"   💰 Макс: ${opp['max_price']:.2f}\n\n"
+            response += f" 📊 Спред: {opp['spread_percent']}%\n"
+            response += f" 💰 Мин: ${opp['min_price']:.2f}\n"
+            response += f" 💰 Макс: ${opp['max_price']:.2f}\n\n"
 
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(response, reply_markup=reply_markup, parse_mode="HTML")
+
+        await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
 
     async def show_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Статус бота и информации о кэше"""
+        # Определяем метод отправки в зависимости от типа update
+        if update.callback_query:
+            send_method = update.callback_query.edit_message_text
+        else:
+            send_method = update.message.reply_text
+
         cache_size = len(self.funding_cache) if self.funding_cache else 0
         last_update = self.funding_cache_updated_at.strftime("%Y-%m-%d %H:%M:%S UTC") if self.funding_cache_updated_at else "Никогда"
-        
+
         # Статистика по данным
         if self.funding_cache:
             positive_count = len([x for x in self.funding_cache if x.get('rate', 0) > 0])
             negative_count = len([x for x in self.funding_cache if x.get('rate', 0) < 0])
             zero_count = len([x for x in self.funding_cache if x.get('rate', 0) == 0])
-            
             unique_symbols = len(set(item.get('symbol', '') for item in self.funding_cache))
             unique_exchanges = len(set(item.get('exchangeName', '') for item in self.funding_cache))
         else:
@@ -689,8 +705,8 @@ class CryptoArbBot:
 
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(response, reply_markup=reply_markup, parse_mode="HTML")
+
+        await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
 
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик инлайн-кнопок с улучшенной обработкой ошибок"""
@@ -699,7 +715,6 @@ class CryptoArbBot:
 
         try:
             data = query.data
-            
             if data.startswith("page_"):
                 parts = data.split("_")
                 if len(parts) == 3:
@@ -759,14 +774,14 @@ class CryptoArbBot:
                 else:
                     await update.message.reply_text(f"⚠️ Страница должна быть от 1 до {total_pages}")
                     return
-        
+
         # Если сообщение не номер страницы
         await update.message.reply_text(
             "ℹ️ <b>Быстрая навигация</b>\n\n"
             "Введите номер страницы для быстрого перехода\n"
             "Или используйте команды:\n"
             "/negative - отрицательные фандинги\n"
-            "/positive - положительные фандинги\n" 
+            "/positive - положительные фандинги\n"
             "/top10 - топ 10 фандингов\n"
             "/arbitrage_bundles - арбитражные связки\n"
             "/exchanges - все доступные биржи",
@@ -784,11 +799,11 @@ class CryptoArbBot:
             [InlineKeyboardButton("💰 Ценовой арбитраж", callback_data="nav_price_arb")],
             [InlineKeyboardButton("📊 Статус бота", callback_data="nav_status")],
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
         
+        reply_markup = InlineKeyboardMarkup(keyboard)
         text = "📋 <b>Главное меню</b>\nВыберите раздел:"
         
-        if hasattr(update, 'callback_query') and update.callback_query:
+        if update.callback_query:
             await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
         else:
             await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
@@ -798,14 +813,14 @@ class CryptoArbBot:
         print("🤖 Бот запущен...")
         print("⚡ Кеширование каждые 30 секунд")
         print("📊 Мониторинг фандингов и арбитража")
-        
+
         # Фоновое обновление кэша каждые 30 секунд
         self.application.job_queue.run_repeating(
             self.update_funding_cache,
             interval=30,
             first=0,
         )
-        
+
         # Запускаем бота с обработкой ошибок
         try:
             self.application.run_polling(
