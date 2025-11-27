@@ -362,7 +362,7 @@ class CryptoArbBot:
 
     # ---------- /funding ----------
 
-    async def funding_rates(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+      async def funding_rates(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать фандинг ставки (из кэша)"""
         await update.message.reply_text("🔄 Получаю данные о фандинг ставках из кэша...")
 
@@ -382,7 +382,22 @@ class CryptoArbBot:
         header = symbol if symbol else "всех монет"
         response = f"📊 <b>Текущие фандинг ставки для {header}:</b>\n\n"
 
-        for i, item in enumerate(funding_data[:15]):  # Ограничиваем вывод
+        # Если запрошен конкретный тикер (например /funding BTC) —
+        # показываем ВСЕ биржи для этой монеты, без обрезки.
+        if symbol:
+            items_to_show = sorted(
+                funding_data,
+                key=lambda x: (x.get("marginType", ""), x.get("exchangeName", "")),
+            )
+        else:
+            # Если тикер не задан — берём топ по абсолютному значению ставки (чтобы не заспамить чат).
+            items_to_show = sorted(
+                funding_data,
+                key=lambda x: abs(float(x.get("uMarginList", [{}])[0].get("rate", 0) or 0)),
+                reverse=True,
+            )[:15]
+
+        for item in items_to_show:
             symbol_item = item.get("symbol", "")
             rate_list = item.get("uMarginList", [{}])
             rate = rate_list[0].get("rate", 0) if rate_list else 0
@@ -407,6 +422,7 @@ class CryptoArbBot:
             response += f"   Ставка: {rate_percent}% за {interval}ч\n\n"
 
         await update.message.reply_text(response, parse_mode="HTML")
+
 
     # ---------- /arbitrage (по цене) ----------
 
