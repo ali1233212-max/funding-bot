@@ -32,81 +32,96 @@ class CoinglassAPI:
             'CG-API-KEY': COINGLASS_TOKEN
         }
 
-    def get_funding_rates(self, symbol=None):
+       def get_funding_rates(self, symbol=None):
         """
         Получить ставки фандинга через v4 /futures/funding-rate/exchange-list.
-        Возвращает список в формате, ПОДОБНОМ v3:
-        [
-          {
-            'symbol': 'BTC',
-            'exchangeName': 'Binance',
-            'uMarginList': [{'rate': 0.00123}],
-            'marginType': 'USDT'
-          },
-          ...
-        ]
-        Чтобы твоё остальное код не пришлось менять.
+        Возвращает список в формате, подобном старому v3, чтобы остальной код не менять.
+        Добавлен увеличенный таймаут и повторы при ReadTimeout.
         """
         url = f"{self.base_url_v4}/futures/funding-rate/exchange-list"
         params = {}
         if symbol:
             params['symbol'] = str(symbol).upper()
 
-        try:
-            response = requests.get(url, headers=self.headers_v4, params=params, timeout=10)
+        MAX_RETRIES = 3
+        TIMEOUT = 20  # было 10, делаем побольше
 
-            if response.status_code != 200:
-                logger.warning("Coinglass v4 funding-rate/exchange-list status %s", response.status_code)
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = requests.get(
+                    url,
+                    headers=self.headers_v4,
+                    params=params,
+                    timeout=TIMEOUT
+                )
+                response.raise_for_status()
+
+                data = response.json()
+                if data.get('code') != '0':
+                    logger.warning(
+                        "Coinglass v4 funding-rate/exchange-list error: %s", data
+                    )
+                    return None
+
+                entries = data.get('data', [])
+                result = []
+
+                for entry in entries:
+                    sym = entry.get('symbol', '')
+                    stable_list = entry.get('stablecoin_margin_list') or []
+                    token_list = entry.get('token_margin_list') or []
+
+                    # USDT / USD маржа -> мапим в uMarginList
+                    for row in stable_list:
+                        try:
+                            rate = float(row.get('funding_rate', 0.0))
+                        except (TypeError, ValueError):
+                            rate = 0.0
+                        item = {
+                            'symbol': sym,
+                            'exchangeName': row.get('exchange', ''),
+                            'uMarginList': [{'rate': rate}],
+                            'marginType': 'USDT',
+                            'interval': row.get('funding_rate_interval')
+                        }
+                            # можно фильтровать нулевые, если хочешь
+                        result.append(item)
+
+                    # Coin-маржа -> тоже в uMarginList, но помечаем marginType=COIN
+                    for row in token_list:
+                        try:
+                            rate = float(row.get('funding_rate', 0.0))
+                        except (TypeError, ValueError):
+                            rate = 0.0
+                        item = {
+                            'symbol': sym,
+                            'exchangeName': row.get('exchange', ''),
+                            'uMarginList': [{'rate': rate}],
+                            'marginType': 'COIN',
+                            'interval': row.get('funding_rate_interval')
+                        }
+                        result.append(item)
+
+                return result
+
+            except requests.exceptions.ReadTimeout:
+                logger.warning(
+                    "Таймаут при запросе к Coinglass v4 (попытка %d/%d)",
+                    attempt,
+                    MAX_RETRIES,
+                )
+                if attempt == MAX_RETRIES:
+                    return None
+                # идём на следующий цикл и пробуем ещё раз
+
+            except Exception as e:
+                # Любая другая ошибка — логируем один раз и выходим
+                logger.warning(
+                    "Ошибка при запросе к Coinglass v4 funding-rate/exchange-list: %s",
+                    e,
+                )
                 return None
 
-            data = response.json()
-            if data.get('code') != '0':
-                logger.warning("Coinglass v4 funding-rate/exchange-list error: %s", data)
-                return None
-
-            entries = data.get('data', [])
-            result = []
-
-            for entry in entries:
-                sym = entry.get('symbol', '')
-                stable_list = entry.get('stablecoin_margin_list') or []
-                token_list = entry.get('token_margin_list') or []
-
-                # USDT / USD маржа -> мапим в uMarginList
-                for row in stable_list:
-                    try:
-                        rate = float(row.get('funding_rate', 0.0))
-                    except (TypeError, ValueError):
-                        rate = 0.0
-                    item = {
-                        'symbol': sym,
-                        'exchangeName': row.get('exchange', ''),
-                        'uMarginList': [{'rate': rate}],
-                        'marginType': 'USDT',
-                        'interval': row.get('funding_rate_interval')
-                    }
-                    result.append(item)
-
-                # Coin-маржа -> тоже в uMarginList, но помечаем marginType=COIN
-                for row in token_list:
-                    try:
-                        rate = float(row.get('funding_rate', 0.0))
-                    except (TypeError, ValueError):
-                        rate = 0.0
-                    item = {
-                        'symbol': sym,
-                        'exchangeName': row.get('exchange', ''),
-                        'uMarginList': [{'rate': rate}],
-                        'marginType': 'COIN',
-                        'interval': row.get('funding_rate_interval')
-                    }
-                    result.append(item)
-
-            return result
-
-        except Exception as e:
-            logger.exception(f"Ошибка при запросе к Coinglass v4 funding-rate/exchange-list: {e}")
-            return None
 
     def get_arbitrage_opportunities(self):
         """Получить арбитражные возможности между биржами по ЦЕНЕ (старый v3 /futures/market)"""
