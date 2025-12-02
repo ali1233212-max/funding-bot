@@ -616,12 +616,14 @@ class CryptoArbBot:
             if len(exchanges) < 2:
                 continue
 
-            usdt_exchanges = [e for e in exchanges if e['marginType'] == 'USDT']
-            if len(usdt_exchanges) < 2:
+            # ИСПРАВЛЕНО: раньше брали только marginType == 'USDT', из-за чего Hyperliquid и другие могли пропадать.
+            # Теперь сравниваем все биржи по символу, вне зависимости от типа маржи.
+            valid_exchanges = exchanges
+            if len(valid_exchanges) < 2:
                 continue
 
-            min_item = min(usdt_exchanges, key=lambda x: x['rate'])
-            max_item = max(usdt_exchanges, key=lambda x: x['rate'])
+            min_item = min(valid_exchanges, key=lambda x: x['rate'])
+            max_item = max(valid_exchanges, key=lambda x: x['rate'])
             spread = max_item['rate'] - min_item['rate']
 
             if abs(spread) < 0.0005:
@@ -651,7 +653,7 @@ class CryptoArbBot:
                 "🤷‍♂️ <b>Арбитражные возможности не найдены</b>\n\n"
                 "Возможные причины:\n"
                 "• Слишком маленький спред между биржами\n"
-                "• Недостаточно данных по USDT-марже\n"
+                "• Недостаточно данных по марже\n"
                 "• Рынок в состоянии равновесия"
             )
         else:
