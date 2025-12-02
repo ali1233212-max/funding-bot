@@ -296,44 +296,6 @@ class CryptoArbBot:
                 
         return sorted(list(exchanges))
 
-    def calculate_annual_yield(self, rate, interval):
-        """
-        Расчет годовой доходности по формуле: выплата * количество выплат в сутки * 365
-        """
-        try:
-            interval_float = float(interval)
-            if interval_float <= 0:
-                return None
-                
-            # Количество выплат в сутки
-            daily_payments = 24 / interval_float
-            
-            # Годовая доходность
-            annual_yield = rate * daily_payments * 365 * 100  # умножаем на 100 для перевода в проценты
-            
-            return annual_yield
-        except (ValueError, TypeError, ZeroDivisionError):
-            return None
-
-    def get_payments_per_day(self, interval):
-        """
-        Получить количество выплат в сутки
-        """
-        try:
-            interval_float = float(interval)
-            if interval_float <= 0:
-                return "?"
-                
-            daily_payments = 24 / interval_float
-            
-            # Округляем до целого, если это целое число, иначе оставляем 1 знак после запятой
-            if daily_payments.is_integer():
-                return f"{int(daily_payments)} раз в сутки"
-            else:
-                return f"{daily_payments:.1f} раз в сутки"
-        except (ValueError, TypeError, ZeroDivisionError):
-            return "?"
-
     def setup_handlers(self):
         """Настройка всех обработчиков команд"""
         handlers = [
@@ -467,23 +429,15 @@ class CryptoArbBot:
         for i, item in enumerate(page_data, start=start_idx + 1):
             symbol = item.get("symbol", "N/A")
             exchange = item.get("exchangeName", "N/A")
-            rate = item.get("rate", 0)
+            rate = item.get("rate", 0) * 100
             interval = item.get("interval", "?")
             margin_type = item.get("marginType", "USDT")
-
-            # Расчет годовой доходности
-            annual_yield = self.calculate_annual_yield(rate, interval)
-            payments_per_day = self.get_payments_per_day(interval)
 
             # Эмодзи для визуализации
             emoji = "🔴" if funding_type == "negative" else "🟢"
             response += f"{emoji} <b>{symbol}</b>\n"
             response += f" 🏛️ {exchange} ({margin_type})\n"
-            
-            if annual_yield is not None:
-                response += f" 💰 Годовая доходность: {annual_yield:+.2f}% | ⏰ {payments_per_day}\n\n"
-            else:
-                response += f" 💰 Ставка: {rate*100:+.4f}% | ⏰ {interval}ч\n\n"
+            response += f" 💰 {rate:+.4f}% | ⏰ {interval}ч\n\n"
 
         # Клавиатура пагинации
         keyboard = []
@@ -538,33 +492,17 @@ class CryptoArbBot:
         for i, item in enumerate(positive_data, 1):
             symbol = item.get("symbol", "")
             exchange = item.get("exchangeName", "")
-            rate = item.get("rate", 0)
+            rate = item.get("rate", 0) * 100
             interval = item.get("interval", "?")
-
-            # Расчет годовой доходности
-            annual_yield = self.calculate_annual_yield(rate, interval)
-            payments_per_day = self.get_payments_per_day(interval)
-
-            if annual_yield is not None:
-                response += f"{i}. <b>{symbol}</b> - {annual_yield:+.2f}% годовых ({exchange}, {payments_per_day})\n"
-            else:
-                response += f"{i}. <b>{symbol}</b> - {rate*100:+.4f}% ({exchange}, {interval}ч)\n"
+            response += f"{i}. <b>{symbol}</b> - {rate:+.4f}% ({exchange}, {interval}ч)\n"
 
         response += "\n<b>🔴 Топ 10 отрицательных:</b>\n"
         for i, item in enumerate(negative_data, 1):
             symbol = item.get("symbol", "")
             exchange = item.get("exchangeName", "")
-            rate = item.get("rate", 0)
+            rate = item.get("rate", 0) * 100
             interval = item.get("interval", "?")
-
-            # Расчет годовой доходности
-            annual_yield = self.calculate_annual_yield(rate, interval)
-            payments_per_day = self.get_payments_per_day(interval)
-
-            if annual_yield is not None:
-                response += f"{i}. <b>{symbol}</b> - {annual_yield:+.2f}% годовых ({exchange}, {payments_per_day})\n"
-            else:
-                response += f"{i}. <b>{symbol}</b> - {rate*100:+.4f}% ({exchange}, {interval}ч)\n"
+            response += f"{i}. <b>{symbol}</b> - {rate:+.4f}% ({exchange}, {interval}ч)\n"
 
         # Добавляем информацию о времени обновления
         if self.funding_cache_updated_at:
@@ -620,16 +558,6 @@ class CryptoArbBot:
             if abs(spread) < 0.0005:  # Минимальный спред 0.05%
                 continue
 
-            # Расчет годовой доходности для мин и макс ставок
-            min_annual_yield = self.calculate_annual_yield(min_item['rate'], min_item['interval'])
-            max_annual_yield = self.calculate_annual_yield(max_item['rate'], max_item['interval'])
-            
-            # Расчет годового спреда
-            if min_annual_yield is not None and max_annual_yield is not None:
-                annual_spread = max_annual_yield - min_annual_yield
-            else:
-                annual_spread = None
-
             # Проверяем время выплат
             time_warning = ""
             if min_item['interval'] != max_item['interval']:
@@ -644,9 +572,6 @@ class CryptoArbBot:
                 'min_interval': min_item['interval'],
                 'max_interval': max_item['interval'],
                 'spread': spread,
-                'min_annual_yield': min_annual_yield,
-                'max_annual_yield': max_annual_yield,
-                'annual_spread': annual_spread,
                 'time_warning': time_warning
             })
 
@@ -664,24 +589,9 @@ class CryptoArbBot:
             response += f"📊 Найдено возможностей: {len(opportunities)}\n\n"
             for opp in opportunities[:15]:
                 response += f"🎯 <b>{opp['symbol']}</b>{opp['time_warning']}\n"
-                
-                min_payments = self.get_payments_per_day(opp['min_interval'])
-                max_payments = self.get_payments_per_day(opp['max_interval'])
-                
-                if opp['min_annual_yield'] is not None:
-                    response += f" 📉 {opp['min_exchange']}: {opp['min_annual_yield']:+.2f}% годовых ({min_payments})\n"
-                else:
-                    response += f" 📉 {opp['min_exchange']}: {opp['min_rate']*100:+.4f}% ({opp['min_interval']}ч)\n"
-                    
-                if opp['max_annual_yield'] is not None:
-                    response += f" 📈 {opp['max_exchange']}: {opp['max_annual_yield']:+.2f}% годовых ({max_payments})\n"
-                else:
-                    response += f" 📈 {opp['max_exchange']}: {opp['max_rate']*100:+.4f}% ({opp['max_interval']}ч)\n"
-                
-                if opp['annual_spread'] is not None:
-                    response += f" 💰 Годовой спред: {opp['annual_spread']:.2f}%\n\n"
-                else:
-                    response += f" 💰 Спред: {opp['spread']*100:.4f}%\n\n"
+                response += f" 📉 {opp['min_exchange']}: {opp['min_rate']*100:+.4f}% ({opp['min_interval']}ч)\n"
+                response += f" 📈 {opp['max_exchange']}: {opp['max_rate']*100:+.4f}% ({opp['max_interval']}ч)\n"
+                response += f" 💰 Спред: {opp['spread']*100:.4f}%\n\n"
 
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -742,7 +652,7 @@ class CryptoArbBot:
 
         await send_method("🔍 Ищу арбитражные возможности по цене...")
 
-        opportunities = await asyncio.to_thread(self.api.get_arbitrage_opportunities)
+        opportunities = self.api.get_arbitrage_opportunities()
         if not opportunities:
             await send_method("🤷‍♂️ Арбитражные возможности по цене не найдены")
             return
