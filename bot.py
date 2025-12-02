@@ -253,8 +253,7 @@ class CryptoArbBot:
         self.funding_cache_updated_at = None
         self.cache_lock = asyncio.Lock()
 
-        # Минимальный модуль ставки, ниже которого считаем её «нулевой» и не используем в арбитраже
-        # (в процентах за интервал, т.е. 0.000001% за интервал)
+        # Минимальный модуль ставки (оставил, но в арбитраже больше не режем по нему)
         self.MIN_ABS_RATE = 1e-6
 
         self.setup_handlers()
@@ -335,18 +334,21 @@ class CryptoArbBot:
 
     def get_filtered_funding(self, funding_type="all"):
         """
-        Фильтрация и сортировка данных по типу
-        rate здесь в процентах за интервал
+        Фильтрация и сортировка данных по типу.
+        ВАЖНО: чтобы Hyperliquid / dYdX и другие биржи с нулевым фандингом не пропадали,
+        нулевые ставки тоже включаем в выборку.
         """
         data = self.get_cached_funding()
         if not data:
             return None
             
         if funding_type == "negative":
-            filtered = [item for item in data if item.get("rate", 0) < 0]
+            # все ставки <= 0 (включая нули, чтобы они не пропадали)
+            filtered = [item for item in data if item.get("rate", 0) <= 0]
             return sorted(filtered, key=lambda x: x["rate"])
         elif funding_type == "positive":
-            filtered = [item for item in data if item.get("rate", 0) > 0]
+            # все ставки >= 0 (включая нули)
+            filtered = [item for item in data if item.get("rate", 0) >= 0]
             return sorted(filtered, key=lambda x: x["rate"], reverse=True)
         else:
             return data
@@ -597,9 +599,9 @@ class CryptoArbBot:
                 continue
 
             rate = item.get("rate", 0)
-            # отфильтровываем заведомо «нулевые» ставки
-            if abs(rate) < self.MIN_ABS_RATE:
-                continue
+            # ВАЖНО: больше НЕ фильтруем по MIN_ABS_RATE, чтобы 0% (Hyperliquid, dYdX и др.) участвовали в арбитраже
+            # if abs(rate) < self.MIN_ABS_RATE:
+            #     continue
 
             if symbol not in symbol_data:
                 symbol_data[symbol] = []
@@ -616,8 +618,7 @@ class CryptoArbBot:
             if len(exchanges) < 2:
                 continue
 
-            # ИСПРАВЛЕНО: раньше брали только marginType == 'USDT', из-за чего Hyperliquid и другие могли пропадать.
-            # Теперь сравниваем все биржи по символу, вне зависимости от типа маржи.
+            # сравниваем все биржи по символу, вне зависимости от типа маржи
             valid_exchanges = exchanges
             if len(valid_exchanges) < 2:
                 continue
