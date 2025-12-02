@@ -31,6 +31,24 @@ class CoinglassAPI:
             "CG-API-KEY": COINGLASS_TOKEN,
         }
 
+    def _normalize_interval(self, val):
+        """
+        Нормализация интервала фандинга в часы.
+        Если приходит None / "" / "?" или некорректное значение — ставим 8ч по умолчанию.
+        """
+        try:
+            if val in (None, "", "?"):
+                return 8
+            hours = float(val)
+            if hours <= 0:
+                return 8
+            # красивый int, если целое
+            if float(hours).is_integer():
+                return int(hours)
+            return hours
+        except Exception:
+            return 8
+
     def get_funding_rates(self):
         """
         Полный запрос всех ставок фандинга с обработкой ошибок
@@ -67,14 +85,16 @@ class CoinglassAPI:
                             rate = float(row.get("funding_rate", 0.0))
                         except (TypeError, ValueError):
                             rate = 0.0
+
+                        interval = self._normalize_interval(row.get("funding_rate_interval"))
                             
                         item = {
                             "symbol": sym,
                             "exchangeName": row.get("exchange", ""),
-                            # ВАЖНО: funding_rate уже в процентах за интервал, например 0.01 = 0.01%
+                            # ВАЖНО: funding_rate уже в процентах за интервал (например, 0.01 = 0.01%)
                             "rate": rate,
                             "marginType": "USDT",
-                            "interval": row.get("funding_rate_interval", "?"),
+                            "interval": interval,
                             "nextFundingTime": row.get("next_funding_time", ""),
                         }
                         result.append(item)
@@ -85,14 +105,15 @@ class CoinglassAPI:
                             rate = float(row.get("funding_rate", 0.0))
                         except (TypeError, ValueError):
                             rate = 0.0
+
+                        interval = self._normalize_interval(row.get("funding_rate_interval"))
                             
                         item = {
                             "symbol": sym,
                             "exchangeName": row.get("exchange", ""),
-                            # funding_rate также в процентах за интервал
                             "rate": rate,
                             "marginType": "COIN",
-                            "interval": row.get("funding_rate_interval", "?"),
+                            "interval": interval,
                             "nextFundingTime": row.get("next_funding_time", ""),
                         }
                         result.append(item)
@@ -255,9 +276,33 @@ class CryptoArbBot:
             hours = 8.0
 
         periods_per_year = 365.0 * 24.0 / hours
-        # funding_rate уже в %, поэтому годовые % = rate * кол-во периодов в году
         annual_percent = rate * periods_per_year
         return annual_percent
+
+    def get_exchange_emoji(self, exchange: str) -> str:
+        """
+        Эмодзи для бирж для удобного визуального восприятия.
+        Если биржа неизвестна — используется 🏛️.
+        """
+        if not exchange:
+            return "🏛️"
+        name = exchange.strip().upper()
+        mapping = {
+            "BINANCE": "🟡",
+            "BYBIT": "🟠",
+            "OKX": "⚫️",
+            "OKEX": "⚫️",
+            "BITGET": "🟢",
+            "MEXC": "🟣",
+            "GATE": "🔵",
+            "GATE.IO": "🔵",
+            "KUCOIN": "🧩",
+            "BITMEX": "📉",
+            "DERIBIT": "📗",
+            "KRAKEN": "🦑",
+            "COINBASE": "🇺🇸",
+        }
+        return mapping.get(name, "🏛️")
 
     async def update_funding_cache(self, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -455,20 +500,22 @@ class CryptoArbBot:
         }
         response = f"<b>{title_map[funding_type]} (APR)</b>\n"
         response += f"📄 Страница {page}/{total_pages} | Всего записей: {total_items}\n"
-        response += "💡 Показана приблизительная <bгодовая доходность (APR)</b> при линейном пересчёте текущей ставки за интервал.\n\n"
+        response += "💡 Показана приблизительная <b>годовая доходность (APR)</b> при линейном пересчёте текущей ставки за интервал.\n\n"
 
         for i, item in enumerate(page_data, start=start_idx + 1):
             symbol = item.get("symbol", "N/A")
             exchange = item.get("exchangeName", "N/A")
             raw_rate = item.get("rate", 0)          # % за интервал
-            interval = item.get("interval", "?")
+            interval = item.get("interval", 8)      # уже нормализовано, но подстрахуемся
             margin_type = item.get("marginType", "USDT")
 
             annual_rate = self.annualize_rate(raw_rate, interval)  # % годовых
+            ex_emoji = self.get_exchange_emoji(exchange)
+
             # Эмодзи для визуализации
             emoji = "🔴" if funding_type == "negative" else "🟢"
             response += f"{emoji} <b>{symbol}</b>\n"
-            response += f" 🏛️ {exchange} ({margin_type})\n"
+            response += f" {ex_emoji} {exchange} ({margin_type})\n"
             response += f" 💰 {annual_rate:+.2f}% годовых | ⏰ интервал: {interval}ч | ставка за интервал: {raw_rate:.6f}%\n\n"
 
         # Клавиатура пагинации
@@ -524,24 +571,26 @@ class CryptoArbBot:
         for i, item in enumerate(positive_data, 1):
             symbol = item.get("symbol", "")
             exchange = item.get("exchangeName", "")
-            interval = item.get("interval", "?")
+            interval = item.get("interval", 8)
             raw_rate = item.get("rate", 0)  # % за интервал
             annual_rate = self.annualize_rate(raw_rate, interval)
+            ex_emoji = self.get_exchange_emoji(exchange)
             response += (
                 f"{i}. <b>{symbol}</b> - {annual_rate:+.2f}% годовых "
-                f"(биржа: {exchange}, интервал: {interval}ч, ставка за интервал: {raw_rate:.6f}%)\n"
+                f"({ex_emoji} {exchange}, интервал: {interval}ч, ставка за интервал: {raw_rate:.6f}%)\n"
             )
 
         response += "\n<b>🔴 Топ 10 отрицательных (годовых):</b>\n"
         for i, item in enumerate(negative_data, 1):
             symbol = item.get("symbol", "")
             exchange = item.get("exchangeName", "")
-            interval = item.get("interval", "?")
+            interval = item.get("interval", 8)
             raw_rate = item.get("rate", 0)  # % за интервал
             annual_rate = self.annualize_rate(raw_rate, interval)
+            ex_emoji = self.get_exchange_emoji(exchange)
             response += (
                 f"{i}. <b>{symbol}</b> - {annual_rate:+.2f}% годовых "
-                f"(биржа: {exchange}, интервал: {interval}ч, ставка за интервал: {raw_rate:.6f}%)\n"
+                f"({ex_emoji} {exchange}, интервал: {interval}ч, ставка за интервал: {raw_rate:.6f}%)\n"
             )
 
         # Добавляем информацию о времени обновления
@@ -575,7 +624,7 @@ class CryptoArbBot:
             symbol_data[symbol].append({
                 'exchange': item.get("exchangeName", ""),
                 'rate': item.get("rate", 0),           # % за интервал
-                'interval': item.get("interval", "?"),
+                'interval': item.get("interval", 8),
                 'marginType': item.get("marginType", "")
             })
 
@@ -634,13 +683,16 @@ class CryptoArbBot:
                 max_annual = self.annualize_rate(opp['max_rate'], opp['max_interval'])
                 spread_annual = max_annual - min_annual
 
+                min_emoji = self.get_exchange_emoji(opp['min_exchange'])
+                max_emoji = self.get_exchange_emoji(opp['max_exchange'])
+
                 response += f"🎯 <b>{opp['symbol']}</b>{opp['time_warning']}\n"
                 response += (
-                    f" 📉 {opp['min_exchange']}: {min_annual:+.2f}% годовых "
+                    f" 📉 {min_emoji} {opp['min_exchange']}: {min_annual:+.2f}% годовых "
                     f"(интервал: {opp['min_interval']}ч, ставка за интервал: {opp['min_rate']:.6f}%)\n"
                 )
                 response += (
-                    f" 📈 {opp['max_exchange']}: {max_annual:+.2f}% годовых "
+                    f" 📈 {max_emoji} {opp['max_exchange']}: {max_annual:+.2f}% годовых "
                     f"(интервал: {opp['max_interval']}ч, ставка за интервал: {opp['max_rate']:.6f}%)\n"
                 )
                 response += f" 💰 Спред (APR): {spread_annual:.2f}% годовых\n\n"
@@ -674,7 +726,8 @@ class CryptoArbBot:
         exchanges_per_line = 3
         for i in range(0, len(exchanges), exchanges_per_line):
             line_exchanges = exchanges[i:i + exchanges_per_line]
-            response += " • " + " • ".join(line_exchanges) + "\n"
+            decorated = [f"{self.get_exchange_emoji(ex)} {ex}" for ex in line_exchanges]
+            response += " • " + " • ".join(decorated) + "\n"
 
         # Добавляем статистику по данным
         unique_symbols = len(set(item.get('symbol', '') for item in self.funding_cache))
