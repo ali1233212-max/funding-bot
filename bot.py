@@ -231,6 +231,26 @@ class CryptoArbBot:
         self.cache_lock = asyncio.Lock()
         self.setup_handlers()
 
+    def annualize_rate(self, rate, interval):
+        """
+        Перевод ставки фандинга за период в годовую (простая APR, без учета сложного процента)
+        rate      - ставка за один период (например, за 8 часов) в долях (0.01 = 1%)
+        interval  - длительность периода в часах (строка или число)
+        """
+        try:
+            if interval in (None, "", "?"):
+                hours = 8.0
+            else:
+                hours = float(interval)
+        except (TypeError, ValueError):
+            hours = 8.0
+
+        if hours <= 0:
+            hours = 8.0
+
+        periods_per_year = 365 * 24 / hours
+        return rate * periods_per_year
+
     async def update_funding_cache(self, context: ContextTypes.DEFAULT_TYPE):
         """
         Безопасное обновление кэша с блокировкой
@@ -274,10 +294,10 @@ class CryptoArbBot:
             
         if funding_type == "negative":
             filtered = [item for item in data if item.get("rate", 0) < 0]
-            return sorted(filtered, key=lambda x: x["rate"])  # от -1000% до -0.1%
+            return sorted(filtered, key=lambda x: x["rate"])  # от -1000% до -0.1% (за период)
         elif funding_type == "positive":
             filtered = [item for item in data if item.get("rate", 0) > 0]
-            return sorted(filtered, key=lambda x: x["rate"], reverse=True)  # от 1000% до 0.1%
+            return sorted(filtered, key=lambda x: x["rate"], reverse=True)  # от 1000% до 0.1% (за период)
         else:
             return data
 
@@ -360,6 +380,7 @@ class CryptoArbBot:
             "• Сортировка по убыванию процента\n"
             "• Проверка времени выплат в арбитраже\n"
             "• Кеширование каждые 30 секунд\n\n"
+            "Все ставки показываются в <b>процентах годовых (APR)</b>.\n\n"
             "Используйте кнопки ниже для быстрого доступа!"
         )
         
@@ -374,7 +395,7 @@ class CryptoArbBot:
         await self.show_funding_page(update, context, "positive", 1)
 
     async def show_funding_page(self, update: Update, context: ContextTypes.DEFAULT_TYPE, funding_type: str, page: int):
-        """Показать страницу с фандингами"""
+        """Показать страницу с фандингами (в процентах годовых)"""
         # Определяем метод отправки в зависимости от типа update
         if update.callback_query:
             send_method = update.callback_query.edit_message_text
@@ -423,21 +444,24 @@ class CryptoArbBot:
             "negative": "🔴 Отрицательные фандинги",
             "positive": "🟢 Положительные фандинги"
         }
-        response = f"<b>{title_map[funding_type]}</b>\n"
-        response += f"📄 Страница {page}/{total_pages} | Всего записей: {total_items}\n\n"
+        response = f"<b>{title_map[funding_type]} (APR)</b>\n"
+        response += f"📄 Страница {page}/{total_pages} | Всего записей: {total_items}\n"
+        response += f"💡 Ставки показаны в пересчёте на <b>годовые проценты (APR)</b>\n\n"
 
         for i, item in enumerate(page_data, start=start_idx + 1):
             symbol = item.get("symbol", "N/A")
             exchange = item.get("exchangeName", "N/A")
-            rate = item.get("rate", 0) * 100
+            raw_rate = item.get("rate", 0)
             interval = item.get("interval", "?")
             margin_type = item.get("marginType", "USDT")
+
+            annual_rate = self.annualize_rate(raw_rate, interval) * 100
 
             # Эмодзи для визуализации
             emoji = "🔴" if funding_type == "negative" else "🟢"
             response += f"{emoji} <b>{symbol}</b>\n"
             response += f" 🏛️ {exchange} ({margin_type})\n"
-            response += f" 💰 {rate:+.4f}% | ⏰ {interval}ч\n\n"
+            response += f" 💰 {annual_rate:+.2f}% годовых | ⏰ {interval}ч\n\n"
 
         # Клавиатура пагинации
         keyboard = []
@@ -473,7 +497,7 @@ class CryptoArbBot:
             await send_method(error_msg, parse_mode="HTML")
 
     async def show_top10(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Топ 10 положительных и отрицательных фандингов"""
+        """Топ 10 положительных и отрицательных фандингов (в годовых процентах)"""
         # Определяем метод отправки в зависимости от типа update
         if update.callback_query:
             send_method = update.callback_query.edit_message_text
@@ -487,22 +511,24 @@ class CryptoArbBot:
         positive_data = self.get_filtered_funding("positive")[:10]
         negative_data = self.get_filtered_funding("negative")[:10]
 
-        response = "<b>🚀 Топ 10 лучших фандингов</b>\n\n"
-        response += "<b>🟢 Топ 10 положительных:</b>\n"
+        response = "<b>🚀 Топ 10 лучших фандингов (APR)</b>\n\n"
+        response += "<b>🟢 Топ 10 положительных (годовых):</b>\n"
         for i, item in enumerate(positive_data, 1):
             symbol = item.get("symbol", "")
             exchange = item.get("exchangeName", "")
-            rate = item.get("rate", 0) * 100
             interval = item.get("interval", "?")
-            response += f"{i}. <b>{symbol}</b> - {rate:+.4f}% ({exchange}, {interval}ч)\n"
+            raw_rate = item.get("rate", 0)
+            annual_rate = self.annualize_rate(raw_rate, interval) * 100
+            response += f"{i}. <b>{symbol}</b> - {annual_rate:+.2f}% годовых ({exchange}, {interval}ч)\n"
 
-        response += "\n<b>🔴 Топ 10 отрицательных:</b>\n"
+        response += "\n<b>🔴 Топ 10 отрицательных (годовых):</b>\n"
         for i, item in enumerate(negative_data, 1):
             symbol = item.get("symbol", "")
             exchange = item.get("exchangeName", "")
-            rate = item.get("rate", 0) * 100
             interval = item.get("interval", "?")
-            response += f"{i}. <b>{symbol}</b> - {rate:+.4f}% ({exchange}, {interval}ч)\n"
+            raw_rate = item.get("rate", 0)
+            annual_rate = self.annualize_rate(raw_rate, interval) * 100
+            response += f"{i}. <b>{symbol}</b> - {annual_rate:+.2f}% годовых ({exchange}, {interval}ч)\n"
 
         # Добавляем информацию о времени обновления
         if self.funding_cache_updated_at:
@@ -515,7 +541,7 @@ class CryptoArbBot:
         await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
 
     async def show_arbitrage_bundles(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Арбитражные связки с проверкой времени выплат"""
+        """Арбитражные связки с проверкой времени выплат (ставки в годовых процентах)"""
         # Определяем метод отправки в зависимости от типа update
         if update.callback_query:
             send_method = update.callback_query.edit_message_text
@@ -550,12 +576,12 @@ class CryptoArbBot:
             if len(usdt_exchanges) < 2:
                 continue
 
-            # Находим мин и макс ставки
+            # Находим мин и макс ставки (по ставке за период)
             min_item = min(usdt_exchanges, key=lambda x: x['rate'])
             max_item = max(usdt_exchanges, key=lambda x: x['rate'])
             spread = max_item['rate'] - min_item['rate']
 
-            if abs(spread) < 0.0005:  # Минимальный спред 0.05%
+            if abs(spread) < 0.0005:  # Минимальный спред 0.05% за период
                 continue
 
             # Проверяем время выплат
@@ -575,10 +601,10 @@ class CryptoArbBot:
                 'time_warning': time_warning
             })
 
-        # Сортируем по спреду
+        # Сортируем по спреду (по ставке за период)
         opportunities.sort(key=lambda x: abs(x['spread']), reverse=True)
 
-        response = "<b>⚖️ Связки арбитража фандинга</b>\n\n"
+        response = "<b>⚖️ Связки арбитража фандинга (APR)</b>\n\n"
         if not opportunities:
             response += "🤷‍♂️ <b>Арбитражные возможности не найдены</b>\n\n"
             response += "Это может быть потому что:\n"
@@ -586,12 +612,17 @@ class CryptoArbBot:
             response += "• Недостаточно данных по USDT-марже\n"
             response += "• Рынок в состоянии равновесия"
         else:
-            response += f"📊 Найдено возможностей: {len(opportunities)}\n\n"
+            response += f"📊 Найдено возможностей: {len(opportunities)}\n"
+            response += "💡 Ставки показаны в пересчёте на <b>годовые проценты (APR)</b>\n\n"
             for opp in opportunities[:15]:
+                min_annual = self.annualize_rate(opp['min_rate'], opp['min_interval']) * 100
+                max_annual = self.annualize_rate(opp['max_rate'], opp['max_interval']) * 100
+                spread_annual = max_annual - min_annual
+
                 response += f"🎯 <b>{opp['symbol']}</b>{opp['time_warning']}\n"
-                response += f" 📉 {opp['min_exchange']}: {opp['min_rate']*100:+.4f}% ({opp['min_interval']}ч)\n"
-                response += f" 📈 {opp['max_exchange']}: {opp['max_rate']*100:+.4f}% ({opp['max_interval']}ч)\n"
-                response += f" 💰 Спред: {opp['spread']*100:.4f}%\n\n"
+                response += f" 📉 {opp['min_exchange']}: {min_annual:+.2f}% годовых ({opp['min_interval']}ч)\n"
+                response += f" 📈 {opp['max_exchange']}: {max_annual:+.2f}% годовых ({opp['max_interval']}ч)\n"
+                response += f" 💰 Спред: {spread_annual:.2f}% годовых\n\n"
 
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -697,10 +728,10 @@ class CryptoArbBot:
             f"• 📈 Уникальные символы: {unique_symbols}\n"
             f"• 🏛️ Уникальные биржи: {unique_exchanges}\n\n"
             f"<b>Статистика фандингов:</b>\n"
-            f"• 🟢 Положительные: {positive_count}\n"
-            f"• 🔴 Отрицательные: {negative_count}\n"
+            f"• 🟢 Положительные (по ставке за период): {positive_count}\n"
+            f"• 🔴 Отрицательные (по ставке за период): {negative_count}\n"
             f"• ⚪ Нулевые: {zero_count}\n\n"
-            f"<i>Кэш обновляется каждые 30 секунд</i>"
+            f"<i>Кэш обновляется каждые 30 секунд. Отображение доходности — в годовых процентах (APR).</i>"
         )
 
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
