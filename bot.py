@@ -71,6 +71,7 @@ class CoinglassAPI:
                         item = {
                             "symbol": sym,
                             "exchangeName": row.get("exchange", ""),
+                            # ВАЖНО: funding_rate уже в процентах за интервал, например 0.01 = 0.01%
                             "rate": rate,
                             "marginType": "USDT",
                             "interval": row.get("funding_rate_interval", "?"),
@@ -88,6 +89,7 @@ class CoinglassAPI:
                         item = {
                             "symbol": sym,
                             "exchangeName": row.get("exchange", ""),
+                            # funding_rate также в процентах за интервал
                             "rate": rate,
                             "marginType": "COIN",
                             "interval": row.get("funding_rate_interval", "?"),
@@ -166,6 +168,7 @@ class CoinglassAPI:
     def calculate_funding_arbitrage_from_items(self, funding_items, symbol=None, min_spread=0.0005):
         """
         Расчет арбитража фандинга из загруженных данных
+        min_spread тут в тех же единицах, что и rate (проценты за интервал)
         """
         if not funding_items:
             return None
@@ -233,9 +236,12 @@ class CryptoArbBot:
 
     def annualize_rate(self, rate, interval):
         """
-        Перевод ставки фандинга за период в годовую (простая APR, без учета сложного процента)
-        rate      - ставка за один период (например, за 8 часов) в долях (0.01 = 1%)
-        interval  - длительность периода в часах (строка или число)
+        Перевод ставки фандинга за период в годовую ПРОЦЕНТНУЮ ставку (APR).
+        ВАЖНО:
+        - rate — уже в процентах за один интервал (как в Coinglass docs).
+          Пример: rate = 0.01 означает 0.01% за интервал.
+        - interval — длительность интервала в часах (4, 8 и т.д.)
+        Результат: годовая ставка в ПРОЦЕНТАХ (например, 25.3 означает 25.3% APR).
         """
         try:
             if interval in (None, "", "?"):
@@ -248,8 +254,10 @@ class CryptoArbBot:
         if hours <= 0:
             hours = 8.0
 
-        periods_per_year = 365 * 24 / hours
-        return rate * periods_per_year
+        periods_per_year = 365.0 * 24.0 / hours
+        # funding_rate уже в %, поэтому годовые % = rate * кол-во периодов в году
+        annual_percent = rate * periods_per_year
+        return annual_percent
 
     async def update_funding_cache(self, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -287,6 +295,7 @@ class CryptoArbBot:
     def get_filtered_funding(self, funding_type="all"):
         """
         Фильтрация и сортировка данных по типу
+        rate здесь всё ещё в процентах за интервал, как в API
         """
         data = self.get_cached_funding()
         if not data:
@@ -294,10 +303,10 @@ class CryptoArbBot:
             
         if funding_type == "negative":
             filtered = [item for item in data if item.get("rate", 0) < 0]
-            return sorted(filtered, key=lambda x: x["rate"])  # от -1000% до -0.1% (за период)
+            return sorted(filtered, key=lambda x: x["rate"])  # от более отрицательных к менее
         elif funding_type == "positive":
             filtered = [item for item in data if item.get("rate", 0) > 0]
-            return sorted(filtered, key=lambda x: x["rate"], reverse=True)  # от 1000% до 0.1% (за период)
+            return sorted(filtered, key=lambda x: x["rate"], reverse=True)
         else:
             return data
 
@@ -380,7 +389,7 @@ class CryptoArbBot:
             "• Сортировка по убыванию процента\n"
             "• Проверка времени выплат в арбитраже\n"
             "• Кеширование каждые 30 секунд\n\n"
-            "Все ставки показываются в <b>процентах годовых (APR)</b>.\n\n"
+            "Все ставки показываются в <b>процентах годовых (APR)</b>, рассчитанных из текущей ставки за интервал.\n\n"
             "Используйте кнопки ниже для быстрого доступа!"
         )
         
@@ -446,22 +455,21 @@ class CryptoArbBot:
         }
         response = f"<b>{title_map[funding_type]} (APR)</b>\n"
         response += f"📄 Страница {page}/{total_pages} | Всего записей: {total_items}\n"
-        response += f"💡 Ставки показаны в пересчёте на <b>годовые проценты (APR)</b>\n\n"
+        response += "💡 Показана приблизительная <bгодовая доходность (APR)</b> при линейном пересчёте текущей ставки за интервал.\n\n"
 
         for i, item in enumerate(page_data, start=start_idx + 1):
             symbol = item.get("symbol", "N/A")
             exchange = item.get("exchangeName", "N/A")
-            raw_rate = item.get("rate", 0)
+            raw_rate = item.get("rate", 0)          # % за интервал
             interval = item.get("interval", "?")
             margin_type = item.get("marginType", "USDT")
 
-            annual_rate = self.annualize_rate(raw_rate, interval) * 100
-
+            annual_rate = self.annualize_rate(raw_rate, interval)  # % годовых
             # Эмодзи для визуализации
             emoji = "🔴" if funding_type == "negative" else "🟢"
             response += f"{emoji} <b>{symbol}</b>\n"
             response += f" 🏛️ {exchange} ({margin_type})\n"
-            response += f" 💰 {annual_rate:+.2f}% годовых | ⏰ {interval}ч\n\n"
+            response += f" 💰 {annual_rate:+.2f}% годовых | ⏰ интервал: {interval}ч | ставка за интервал: {raw_rate:.6f}%\n\n"
 
         # Клавиатура пагинации
         keyboard = []
@@ -517,18 +525,24 @@ class CryptoArbBot:
             symbol = item.get("symbol", "")
             exchange = item.get("exchangeName", "")
             interval = item.get("interval", "?")
-            raw_rate = item.get("rate", 0)
-            annual_rate = self.annualize_rate(raw_rate, interval) * 100
-            response += f"{i}. <b>{symbol}</b> - {annual_rate:+.2f}% годовых ({exchange}, {interval}ч)\n"
+            raw_rate = item.get("rate", 0)  # % за интервал
+            annual_rate = self.annualize_rate(raw_rate, interval)
+            response += (
+                f"{i}. <b>{symbol}</b> - {annual_rate:+.2f}% годовых "
+                f"(биржа: {exchange}, интервал: {interval}ч, ставка за интервал: {raw_rate:.6f}%)\n"
+            )
 
         response += "\n<b>🔴 Топ 10 отрицательных (годовых):</b>\n"
         for i, item in enumerate(negative_data, 1):
             symbol = item.get("symbol", "")
             exchange = item.get("exchangeName", "")
             interval = item.get("interval", "?")
-            raw_rate = item.get("rate", 0)
-            annual_rate = self.annualize_rate(raw_rate, interval) * 100
-            response += f"{i}. <b>{symbol}</b> - {annual_rate:+.2f}% годовых ({exchange}, {interval}ч)\n"
+            raw_rate = item.get("rate", 0)  # % за интервал
+            annual_rate = self.annualize_rate(raw_rate, interval)
+            response += (
+                f"{i}. <b>{symbol}</b> - {annual_rate:+.2f}% годовых "
+                f"(биржа: {exchange}, интервал: {interval}ч, ставка за интервал: {raw_rate:.6f}%)\n"
+            )
 
         # Добавляем информацию о времени обновления
         if self.funding_cache_updated_at:
@@ -560,7 +574,7 @@ class CryptoArbBot:
                 symbol_data[symbol] = []
             symbol_data[symbol].append({
                 'exchange': item.get("exchangeName", ""),
-                'rate': item.get("rate", 0),
+                'rate': item.get("rate", 0),           # % за интервал
                 'interval': item.get("interval", "?"),
                 'marginType': item.get("marginType", "")
             })
@@ -576,12 +590,13 @@ class CryptoArbBot:
             if len(usdt_exchanges) < 2:
                 continue
 
-            # Находим мин и макс ставки (по ставке за период)
+            # Находим мин и макс ставки (по ставке за интервал)
             min_item = min(usdt_exchanges, key=lambda x: x['rate'])
             max_item = max(usdt_exchanges, key=lambda x: x['rate'])
-            spread = max_item['rate'] - min_item['rate']
+            spread = max_item['rate'] - min_item['rate']  # % за интервал
 
-            if abs(spread) < 0.0005:  # Минимальный спред 0.05% за период
+            # Порог по спреду за интервал, можно подстроить
+            if abs(spread) < 0.0005:  # очень маленький спред в % за интервал
                 continue
 
             # Проверяем время выплат
@@ -601,7 +616,7 @@ class CryptoArbBot:
                 'time_warning': time_warning
             })
 
-        # Сортируем по спреду (по ставке за период)
+        # Сортируем по спреду (по ставке за интервал)
         opportunities.sort(key=lambda x: abs(x['spread']), reverse=True)
 
         response = "<b>⚖️ Связки арбитража фандинга (APR)</b>\n\n"
@@ -613,16 +628,22 @@ class CryptoArbBot:
             response += "• Рынок в состоянии равновесия"
         else:
             response += f"📊 Найдено возможностей: {len(opportunities)}\n"
-            response += "💡 Ставки показаны в пересчёте на <b>годовые проценты (APR)</b>\n\n"
+            response += "💡 Ставки показаны в пересчёте на <b>годовые проценты (APR)</b>, с учётом интервала каждой биржи.\n\n"
             for opp in opportunities[:15]:
-                min_annual = self.annualize_rate(opp['min_rate'], opp['min_interval']) * 100
-                max_annual = self.annualize_rate(opp['max_rate'], opp['max_interval']) * 100
+                min_annual = self.annualize_rate(opp['min_rate'], opp['min_interval'])
+                max_annual = self.annualize_rate(opp['max_rate'], opp['max_interval'])
                 spread_annual = max_annual - min_annual
 
                 response += f"🎯 <b>{opp['symbol']}</b>{opp['time_warning']}\n"
-                response += f" 📉 {opp['min_exchange']}: {min_annual:+.2f}% годовых ({opp['min_interval']}ч)\n"
-                response += f" 📈 {opp['max_exchange']}: {max_annual:+.2f}% годовых ({opp['max_interval']}ч)\n"
-                response += f" 💰 Спред: {spread_annual:.2f}% годовых\n\n"
+                response += (
+                    f" 📉 {opp['min_exchange']}: {min_annual:+.2f}% годовых "
+                    f"(интервал: {opp['min_interval']}ч, ставка за интервал: {opp['min_rate']:.6f}%)\n"
+                )
+                response += (
+                    f" 📈 {opp['max_exchange']}: {max_annual:+.2f}% годовых "
+                    f"(интервал: {opp['max_interval']}ч, ставка за интервал: {opp['max_rate']:.6f}%)\n"
+                )
+                response += f" 💰 Спред (APR): {spread_annual:.2f}% годовых\n\n"
 
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -727,11 +748,12 @@ class CryptoArbBot:
             f"• 🕒 Последнее обновление: {last_update}\n"
             f"• 📈 Уникальные символы: {unique_symbols}\n"
             f"• 🏛️ Уникальные биржи: {unique_exchanges}\n\n"
-            f"<b>Статистика фандингов:</b>\n"
-            f"• 🟢 Положительные (по ставке за период): {positive_count}\n"
-            f"• 🔴 Отрицательные (по ставке за период): {negative_count}\n"
+            f"<b>Статистика фандингов (по текущей ставке за интервал):</b>\n"
+            f"• 🟢 Положительные: {positive_count}\n"
+            f"• 🔴 Отрицательные: {negative_count}\n"
             f"• ⚪ Нулевые: {zero_count}\n\n"
-            f"<i>Кэш обновляется каждые 30 секунд. Отображение доходности — в годовых процентах (APR).</i>"
+            f"<i>Кэш обновляется каждые 30 секунд. Доходность в интерфейсе показана в годовых процентах (APR), "
+            f"исходя из последней ставки за интервал.</i>"
         )
 
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
