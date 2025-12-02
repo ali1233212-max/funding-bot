@@ -279,30 +279,27 @@ class CryptoArbBot:
         annual_percent = rate * periods_per_year
         return annual_percent
 
+    def format_annual_rate(self, annual_rate: float) -> str:
+        """
+        Форматирование годовой ставки, чтобы мелкие значения не превращались в 0.00.
+        """
+        v = float(annual_rate)
+        if abs(v) >= 10:
+            return f"{v:+.2f}%"
+        elif abs(v) >= 1:
+            return f"{v:+.3f}%"
+        elif abs(v) >= 0.1:
+            return f"{v:+.4f}%"
+        else:
+            # очень мелкие значения показываем с 5 знаками,
+            # чтобы не терять инфу (например, на бинансе/окикс)
+            return f"{v:+.5f}%"
+
     def get_exchange_emoji(self, exchange: str) -> str:
         """
-        Эмодзи для бирж для удобного визуального восприятия.
-        Если биржа неизвестна — используется 🏛️.
+        Эмодзи для бирж: по запросу — один и тот же для всех.
         """
-        if not exchange:
-            return "🏛️"
-        name = exchange.strip().upper()
-        mapping = {
-            "BINANCE": "🟡",
-            "BYBIT": "🟠",
-            "OKX": "⚫️",
-            "OKEX": "⚫️",
-            "BITGET": "🟢",
-            "MEXC": "🟣",
-            "GATE": "🔵",
-            "GATE.IO": "🔵",
-            "KUCOIN": "🧩",
-            "BITMEX": "📉",
-            "DERIBIT": "📗",
-            "KRAKEN": "🦑",
-            "COINBASE": "🇺🇸",
-        }
-        return mapping.get(name, "🏛️")
+        return "🏦"
 
     async def update_funding_cache(self, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -506,17 +503,18 @@ class CryptoArbBot:
             symbol = item.get("symbol", "N/A")
             exchange = item.get("exchangeName", "N/A")
             raw_rate = item.get("rate", 0)          # % за интервал
-            interval = item.get("interval", 8)      # уже нормализовано, но подстрахуемся
+            interval = item.get("interval", 8)      # уже нормализовано
             margin_type = item.get("marginType", "USDT")
 
             annual_rate = self.annualize_rate(raw_rate, interval)  # % годовых
+            annual_str = self.format_annual_rate(annual_rate)
             ex_emoji = self.get_exchange_emoji(exchange)
 
             # Эмодзи для визуализации
             emoji = "🔴" if funding_type == "negative" else "🟢"
             response += f"{emoji} <b>{symbol}</b>\n"
             response += f" {ex_emoji} {exchange} ({margin_type})\n"
-            response += f" 💰 {annual_rate:+.2f}% годовых | ⏰ интервал: {interval}ч | ставка за интервал: {raw_rate:.6f}%\n\n"
+            response += f" 💰 {annual_str} годовых | ⏰ интервал: {interval}ч | ставка за интервал: {raw_rate:.6f}%\n\n"
 
         # Клавиатура пагинации
         keyboard = []
@@ -574,9 +572,10 @@ class CryptoArbBot:
             interval = item.get("interval", 8)
             raw_rate = item.get("rate", 0)  # % за интервал
             annual_rate = self.annualize_rate(raw_rate, interval)
+            annual_str = self.format_annual_rate(annual_rate)
             ex_emoji = self.get_exchange_emoji(exchange)
             response += (
-                f"{i}. <b>{symbol}</b> - {annual_rate:+.2f}% годовых "
+                f"{i}. <b>{symbol}</b> - {annual_str} годовых "
                 f"({ex_emoji} {exchange}, интервал: {interval}ч, ставка за интервал: {raw_rate:.6f}%)\n"
             )
 
@@ -587,9 +586,10 @@ class CryptoArbBot:
             interval = item.get("interval", 8)
             raw_rate = item.get("rate", 0)  # % за интервал
             annual_rate = self.annualize_rate(raw_rate, interval)
+            annual_str = self.format_annual_rate(annual_rate)
             ex_emoji = self.get_exchange_emoji(exchange)
             response += (
-                f"{i}. <b>{symbol}</b> - {annual_rate:+.2f}% годовых "
+                f"{i}. <b>{symbol}</b> - {annual_str} годовых "
                 f"({ex_emoji} {exchange}, интервал: {interval}ч, ставка за интервал: {raw_rate:.6f}%)\n"
             )
 
@@ -686,16 +686,20 @@ class CryptoArbBot:
                 min_emoji = self.get_exchange_emoji(opp['min_exchange'])
                 max_emoji = self.get_exchange_emoji(opp['max_exchange'])
 
+                min_annual_str = self.format_annual_rate(min_annual)
+                max_annual_str = self.format_annual_rate(max_annual)
+                spread_annual_str = self.format_annual_rate(spread_annual)
+
                 response += f"🎯 <b>{opp['symbol']}</b>{opp['time_warning']}\n"
                 response += (
-                    f" 📉 {min_emoji} {opp['min_exchange']}: {min_annual:+.2f}% годовых "
+                    f" 📉 {min_emoji} {opp['min_exchange']}: {min_annual_str} годовых "
                     f"(интервал: {opp['min_interval']}ч, ставка за интервал: {opp['min_rate']:.6f}%)\n"
                 )
                 response += (
-                    f" 📈 {max_emoji} {opp['max_exchange']}: {max_annual:+.2f}% годовых "
+                    f" 📈 {max_emoji} {opp['max_exchange']}: {max_annual_str} годовых "
                     f"(интервал: {opp['max_interval']}ч, ставка за интервал: {opp['max_rate']:.6f}%)\n"
                 )
-                response += f" 💰 Спред (APR): {spread_annual:.2f}% годовых\n\n"
+                response += f" 💰 Спред (APR): {spread_annual_str}\n\n"
 
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
