@@ -6,8 +6,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 # Токены
-TELEGRAM_TOKEN = "8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0"
-COINGLASS_TOKEN = "2d73a05799f64daab80329868a5264ea"
+TELEGRAM_TOKEN = "ТВОЙ_ТЕЛЕГРАМ_ТОКЕН"
+COINGLASS_TOKEN = "ТВОЙ_COINGLASS_ТОКЕН"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -790,8 +790,10 @@ class CryptoArbBot:
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
-    async def show_arbitrage_bundles(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Арбитражные связки (APR) — Hyperliquid внутри общего расчёта"""
+    async def show_arbitrage_bundles(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
+        """
+        Арбитражные связки (APR) с пагинацией
+        """
         if update.callback_query:
             send_method = update.callback_query.edit_message_text
         else:
@@ -801,6 +803,7 @@ class CryptoArbBot:
             await send_method("⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.")
             return
 
+        # Группируем по символам
         symbol_data = {}
         for item in self.funding_cache:
             symbol = item.get("symbol", "")
@@ -816,6 +819,7 @@ class CryptoArbBot:
                 "marginType": item.get("marginType", ""),
             })
 
+        # Формируем список возможностей
         opportunities = []
         for symbol, exchanges in symbol_data.items():
             if len(exchanges) < 2:
@@ -859,37 +863,88 @@ class CryptoArbBot:
                 "• Недостаточно данных по марже\n"
                 "• Рынок в состоянии равновесия"
             )
-        else:
-            response += f"📊 Найдено возможностей: {len(opportunities)}\n"
+            keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
+            await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+            return
+
+        # Пагинация
+        items_per_page = 10
+        total_items = len(opportunities)
+        total_pages = (total_items + items_per_page - 1) // items_per_page
+        page = max(1, min(page, total_pages))
+        start_idx = (page - 1) * items_per_page
+        end_idx = start_idx + items_per_page
+        page_data = opportunities[start_idx:end_idx]
+
+        # Сохраняем состояние для ввода номера страницы
+        context.user_data.update({
+            "current_page": page,
+            "total_pages": total_pages,
+            "current_data_type": "arbitrage",
+        })
+
+        response += f"📊 Найдено возможностей: {total_items} | Страница {page}/{total_pages}\n"
+        response += (
+            "💡 Ставки показаны в <b>годовых процентах (APR)</b> "
+            "с учётом интервала каждой биржи.\n\n"
+        )
+
+        for opp in page_data:
+            min_annual = self.annualize_rate(opp["min_rate"], opp["min_interval"])
+            max_annual = self.annualize_rate(opp["max_rate"], opp["max_interval"])
+            spread_annual = max_annual - min_annual
+
+            min_emoji = self.get_exchange_emoji(opp["min_exchange"])
+            max_emoji = self.get_exchange_emoji(opp["max_exchange"])
+
+            min_annual_str = self.format_annual_rate(min_annual)
+            max_annual_str = self.format_annual_rate(max_annual)
+            spread_annual_str = self.format_annual_rate(spread_annual)
+
+            response += f"🎯 <b>{opp['symbol']}</b>{opp['time_warning']}\n"
             response += (
-                "💡 Ставки показаны в <b>годовых процентах (APR)</b> "
-                "с учётом интервала каждой биржи.\n\n"
+                f" 📉 {min_emoji} {opp['min_exchange']}: {min_annual_str} годовых "
+                f"(интервал: {opp['min_interval']}ч, ставка за интервал: {opp['min_rate']:.6f}%)\n"
             )
-            for opp in opportunities[:15]:
-                min_annual = self.annualize_rate(opp["min_rate"], opp["min_interval"])
-                max_annual = self.annualize_rate(opp["max_rate"], opp["max_interval"])
-                spread_annual = max_annual - min_annual
+            response += (
+                f" 📈 {max_emoji} {opp['max_exchange']}: {max_annual_str} годовых "
+                f"(интервал: {opp['max_interval']}ч, ставка за интервал: {opp['max_rate']:.6f}%)\n"
+            )
+            response += f" 💰 Спред (APR): {spread_annual_str}\n\n"
 
-                min_emoji = self.get_exchange_emoji(opp["min_exchange"])
-                max_emoji = self.get_exchange_emoji(opp["max_exchange"])
-
-                min_annual_str = self.format_annual_rate(min_annual)
-                max_annual_str = self.format_annual_rate(max_annual)
-                spread_annual_str = self.format_annual_rate(spread_annual)
-
-                response += f"🎯 <b>{opp['symbol']}</b>{opp['time_warning']}\n"
-                response += (
-                    f" 📉 {min_emoji} {opp['min_exchange']}: {min_annual_str} годовых "
-                    f"(интервал: {opp['min_interval']}ч, ставка за интервал: {opp['min_rate']:.6f}%)\n"
+        # Клавиатура пагинации
+        keyboard = []
+        if total_pages > 1:
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(
+                    InlineKeyboardButton("◀ Назад", callback_data=f"page_arb_{page-1}")
                 )
-                response += (
-                    f" 📈 {max_emoji} {opp['max_exchange']}: {max_annual_str} годовых "
-                    f"(интервал: {opp['max_interval']}ч, ставка за интервал: {opp['max_rate']:.6f}%)\n"
+            nav_buttons.append(
+                InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="page_arb_info")
+            )
+            if page < total_pages:
+                nav_buttons.append(
+                    InlineKeyboardButton("Вперёд ▶", callback_data=f"page_arb_{page+1}")
                 )
-                response += f" 💰 Спред (APR): {spread_annual_str}\n\n"
+            keyboard.append(nav_buttons)
 
-        keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
-        await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+            if total_pages > 5:
+                quick_pages = set([1, max(1, page - 2), page, min(total_pages, page + 2), total_pages])
+                quick_row = []
+                for p in sorted(quick_pages):
+                    if p == page:
+                        continue
+                    quick_row.append(
+                        InlineKeyboardButton(str(p), callback_data=f"page_arb_{p}")
+                    )
+                if quick_row:
+                    keyboard.append(quick_row)
+
+        keyboard.append([InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
 
     async def show_exchanges(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Список бирж"""
@@ -1117,6 +1172,8 @@ class CryptoArbBot:
                         await self.show_funding_page(update, context, page_type, page)
                     elif page_type == "hl":
                         await self.show_hyperliquid(update, context, page)
+                    elif page_type == "arb":
+                        await self.show_arbitrage_bundles(update, context, page)
             elif data.startswith("nav_"):
                 parts = data.split("_")
                 nav_type = parts[1]
@@ -1129,7 +1186,7 @@ class CryptoArbBot:
                 elif nav_type == "top10":
                     await self.show_top10(update, context)
                 elif nav_type == "arbitrage":
-                    await self.show_arbitrage_bundles(update, context)
+                    await self.show_arbitrage_bundles(update, context, 1)
                 elif nav_type == "exchanges":
                     await self.show_exchanges(update, context)
                 elif nav_type == "price_arb":
@@ -1172,6 +1229,9 @@ class CryptoArbBot:
                         return
                     if data_type == "hyperliquid":
                         await self.show_hyperliquid(update, context, page_num)
+                        return
+                    if data_type == "arbitrage":
+                        await self.show_arbitrage_bundles(update, context, page_num)
                         return
                 else:
                     await update.message.reply_text(
