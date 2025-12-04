@@ -78,7 +78,7 @@ class CoinglassAPI:
                     stable_list = entry.get("stablecoin_margin_list") or []
                     token_list = entry.get("token_margin_list") or []
                     
-                    # USDT маржа
+                    # USDT/USDC/другие стейбл-маржи
                     for row in stable_list:
                         try:
                             rate = float(row.get("funding_rate", 0.0))
@@ -86,15 +86,28 @@ class CoinglassAPI:
                             rate = 0.0
 
                         interval = self._normalize_interval(row.get("funding_rate_interval"))
-                            
+
+                        # 👇 ДОБАВЛЕНО: аккуратно определяем тип стейблкойна
+                        stable_coin = (
+                            row.get("margin_currency")  # возможные варианты названий поля
+                            or row.get("stableCoin")
+                            or row.get("stablecoin")
+                            or row.get("coin")
+                            or "USDT"
+                        )
+                        stable_coin_upper = str(stable_coin).upper()
+
                         item = {
                             "symbol": sym,
                             "exchangeName": row.get("exchange", ""),
                             # funding_rate уже в процентах за интервал (0.01 = 0.01%)
                             "rate": rate,
-                            "marginType": "USDT",
+                            # 👇 БЫЛО: "USDT", ТЕПЕРЬ: реальный тип стейблкойна (USDT/USDC/…)
+                            "marginType": stable_coin_upper,
                             "interval": interval,
                             "nextFundingTime": row.get("next_funding_time", ""),
+                            # сохраняем отдельно, вдруг пригодится для дебага
+                            "stableCoin": stable_coin_upper,
                         }
                         result.append(item)
                     
@@ -118,13 +131,12 @@ class CoinglassAPI:
                         result.append(item)
                 
                 logger.info("Coinglass v4 funding-rate: получили %d записей", len(result))
-                # 👇 ДОБАВЛЕНО: лог списка бирж, которые реально пришли из API
+                # (Можно оставить или убрать лог бирж при желании)
                 try:
                     exchanges = sorted({row.get("exchangeName", "") for row in result if row.get("exchangeName")})
-                    logger.info("Биржи, полученные из exchange-list: %s", ", ".join(exchanges))
+                    logger.info("Биржи в кэше funding-rate: %s", ", ".join(exchanges))
                 except Exception as log_ex:
                     logger.warning("Не удалось залогировать список бирж: %s", log_ex)
-                # 👆 ДОБАВЛЕНО (остальной код не трогался)
 
                 return result
                 
@@ -211,7 +223,9 @@ class CoinglassAPI:
                 continue
                 
             margin_type = item.get("marginType", "USDT")
-            if margin_type != "USDT":
+            # 👇 БЫЛО строго: if margin_type != "USDT": continue
+            # Сейчас допускаем USDT, USDC, USD и общий STABLE
+            if str(margin_type).upper() not in ("USDT", "USDC", "USD", "STABLE"):
                 continue
                 
             rate = item.get("rate", 0)
@@ -354,11 +368,9 @@ class CryptoArbBot:
             return None
             
         if funding_type == "negative":
-            # все ставки <= 0, сортируем по возрастанию (по мере роста)
             filtered = [item for item in data if item.get("rate", 0) <= 0]
             return sorted(filtered, key=lambda x: x["rate"])
         elif funding_type == "positive":
-            # все ставки >= 0, сортируем по убыванию
             filtered = [item for item in data if item.get("rate", 0) >= 0]
             return sorted(filtered, key=lambda x: x["rate"], reverse=True)
         else:
