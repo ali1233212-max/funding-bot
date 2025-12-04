@@ -969,8 +969,8 @@ class CryptoArbBot:
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
-    async def show_hyperliquid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Пары только с биржи Hyperliquid"""
+    async def show_hyperliquid(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
+        """Пары только с биржи Hyperliquid (с пагинацией)"""
         if update.callback_query:
             send_method = update.callback_query.edit_message_text
         else:
@@ -1011,10 +1011,26 @@ class CryptoArbBot:
             reverse=True,
         )
 
-        response = "🌊 <b>Hyperliquid: funding (APR)</b>\n\n"
-        response += f"📊 Всего записей: {len(items_sorted)}\n\n"
+        items_per_page = 30
+        total_items = len(items_sorted)
+        total_pages = (total_items + items_per_page - 1) // items_per_page
+        page = max(1, min(page, total_pages))
+        start_idx = (page - 1) * items_per_page
+        end_idx = start_idx + items_per_page
+        page_data = items_sorted[start_idx:end_idx]
 
-        for item in items_sorted[:30]:
+        # Сохраняем состояние для ввода номера страницы
+        context.user_data.update({
+            'current_page': page,
+            'total_pages': total_pages,
+            'current_data_type': 'hyperliquid',
+        })
+
+        response = "🌊 <b>Hyperliquid: funding (APR)</b>\n\n"
+        response += f"📊 Всего записей: {total_items} | Страница {page}/{total_pages}\n"
+        response += "💡 Ставки показаны как <b>годовые (APR)</b>, рассчитанные из текущей ставки за 8ч.\n\n"
+
+        for item in page_data:
             symbol = item.get("symbol", "N/A")
             raw_rate = float(item.get("rate", 0) or 0.0)
             interval = item.get("interval", 8)
@@ -1028,8 +1044,32 @@ class CryptoArbBot:
                 f"| ставка за интервал: {raw_rate:.6f}%\n\n"
             )
 
-        keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
-        await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        # Клавиатура пагинации
+        keyboard = []
+        if total_pages > 1:
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(InlineKeyboardButton("◀ Назад", callback_data=f"page_hl_{page-1}"))
+            nav_buttons.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="page_hl_info"))
+            if page < total_pages:
+                nav_buttons.append(InlineKeyboardButton("Вперёд ▶", callback_data=f"page_hl_{page+1}"))
+            keyboard.append(nav_buttons)
+
+            # Быстрые переходы (1, текущая -2, +2, последняя)
+            if total_pages > 5:
+                quick_pages = set([1, max(1, page-2), page, min(total_pages, page+2), total_pages])
+                quick_row = []
+                for p in sorted(quick_pages):
+                    if p == page:
+                        continue
+                    quick_row.append(InlineKeyboardButton(str(p), callback_data=f"page_hl_{p}"))
+                if quick_row:
+                    keyboard.append(quick_row)
+
+        keyboard.append([InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
 
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик инлайн-кнопок"""
@@ -1041,9 +1081,14 @@ class CryptoArbBot:
             if data.startswith("page_"):
                 parts = data.split("_")
                 if len(parts) == 3:
-                    funding_type = parts[1]
+                    page_type = parts[1]
                     page = int(parts[2])
-                    await self.show_funding_page(update, context, funding_type, page)
+                    # Страницы отрицательных / положительных фандингов
+                    if page_type in ("negative", "positive"):
+                        await self.show_funding_page(update, context, page_type, page)
+                    # Страницы Hyperliquid
+                    elif page_type == "hl":
+                        await self.show_hyperliquid(update, context, page)
             elif data.startswith("nav_"):
                 parts = data.split("_")
                 nav_type = parts[1]
@@ -1064,7 +1109,7 @@ class CryptoArbBot:
                 elif nav_type == "status":
                     await self.show_status(update, context)
                 elif nav_type == "hyperliquid":
-                    await self.show_hyperliquid(update, context)
+                    await self.show_hyperliquid(update, context, 1)
         except Exception as e:
             logger.error("Ошибка в обработчике кнопок: %s", e)
             try:
@@ -1086,10 +1131,16 @@ class CryptoArbBot:
             user_data = context.user_data
             if 'current_data_type' in user_data and 'total_pages' in user_data:
                 total_pages = user_data['total_pages']
-                funding_type = user_data['current_data_type']
+                data_type = user_data['current_data_type']
                 if 1 <= page_num <= total_pages:
-                    await self.show_funding_page(update, context, funding_type, page_num)
-                    return
+                    # Для отрицательных/положительных
+                    if data_type in ("negative", "positive"):
+                        await self.show_funding_page(update, context, data_type, page_num)
+                        return
+                    # Для Hyperliquid
+                    if data_type == "hyperliquid":
+                        await self.show_hyperliquid(update, context, page_num)
+                        return
                 else:
                     await update.message.reply_text(f"⚠️ Страница должна быть от 1 до {total_pages}")
                     return
@@ -1102,7 +1153,8 @@ class CryptoArbBot:
             "/positive - положительные фандинги\n"
             "/top10 - топ 10 фандингов\n"
             "/arbitrage_bundles - арбитражные связки\n"
-            "/exchanges - все доступные биржи",
+            "/exchanges - все доступные биржи\n"
+            "/hyperliquid - пары Hyperliquid",
             parse_mode="HTML"
         )
 
