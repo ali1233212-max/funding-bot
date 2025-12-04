@@ -6,7 +6,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 # Токены
-TELEGRAM_TOKEN = "2d73a05799f64daab80329868a5264ea"
+TELEGRAM_TOKEN = "8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0"
 COINGLASS_TOKEN = "2d73a05799f64daab80329868a5264ea"
 
 logging.basicConfig(
