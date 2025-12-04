@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 class CoinglassAPI:
     """
-    Обёртка над Coinglass API + Hyperliquid
+    Обёртка над Coinglass API + Hyperliquid + Paradex
     """
     def __init__(self):
         self.base_url_v3 = "https://open-api.coinglass.com/api/pro/v1"
@@ -37,6 +37,12 @@ class CoinglassAPI:
         self.headers_v4 = {
             "accept": "application/json",
             "CG-API-KEY": COINGLASS_TOKEN,
+        }
+
+        # Публичный REST API Paradex (без ключей)
+        self.paradex_base_url = "https://api.prod.paradex.trade/v1"
+        self.paradex_headers = {
+            "accept": "application/json",
         }
 
     def _normalize_interval(self, val):
@@ -57,7 +63,7 @@ class CoinglassAPI:
 
     def get_funding_rates(self):
         """
-        Полный запрос всех ставок фандинга с Coinglass + доп. добавление Hyperliquid
+        Полный запрос всех ставок фандинга с Coinglass + доп. добавление Hyperliquid + Paradex
         """
         url = f"{self.base_url_v4}/futures/funding-rate/exchange-list"
         MAX_RETRIES = 3
@@ -159,6 +165,31 @@ class CoinglassAPI:
                         logger.info("Hyperliquid: нативный API вернул 0 записей")
                 except Exception as hl_ex:
                     logger.warning("Ошибка при добавлении Hyperliquid: %s", hl_ex)
+
+                # Добавляем Paradex из нативного API
+                try:
+                    pdx_items = self._get_paradex_funding()
+                    if pdx_items:
+                        existing_keys = {
+                            (str(row.get("symbol")), str(row.get("exchangeName")).lower())
+                            for row in result
+                        }
+                        added = 0
+                        for it in pdx_items:
+                            key = (str(it.get("symbol")), str(it.get("exchangeName")).lower())
+                            if key in existing_keys:
+                                continue
+                            result.append(it)
+                            existing_keys.add(key)
+                            added += 1
+                        logger.info(
+                            "Paradex: добавлено %d новых записей в общий кэш фандинга",
+                            added,
+                        )
+                    else:
+                        logger.info("Paradex: нативный API вернул 0 записей")
+                except Exception as pdx_ex:
+                    logger.warning("Ошибка при добавлении Paradex: %s", pdx_ex)
 
                 return result
 
@@ -300,6 +331,143 @@ class CoinglassAPI:
             try:
                 syms = sorted({it["symbol"] for it in items if it.get("symbol")})
                 logger.info("Hyperliquid symbols в кэше (первые 20): %s", ", ".join(syms[:20]))
+            except Exception:
+                pass
+
+        return items
+
+    def _get_paradex_funding(self):
+        """
+        Загрузка ставок фандинга с Paradex через публичный REST API.
+
+        Используем:
+        - GET /v1/markets         — статические данные по рынкам (asset_kind, funding_period_hours, settlement_currency)
+        - GET /v1/markets/summary — динамика по рынкам (funding_rate и т.д.)
+
+        На выходе возвращаем список словарей в том же формате, что и Coinglass/Hyperliquid:
+        {
+            "symbol": "BTC-USD-PERP",
+            "exchangeName": "Paradex",
+            "rate": <проценты за интервал>,
+            "marginType": "USDC",
+            "interval": 8,
+            "nextFundingTime": "",
+            "stableCoin": "USDC",
+            "source": "paradex_markets_summary",
+        }
+        """
+        items = []
+
+        # 1) Статика: /markets
+        markets_meta = {}
+        try:
+            url_markets = f"{self.paradex_base_url}/markets"
+            resp = requests.get(url_markets, headers=self.paradex_headers, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            markets = data.get("results", []) or []
+
+            for m in markets:
+                try:
+                    chain_details = m.get("chain_details") or {}
+                    symbol = m.get("symbol") or chain_details.get("symbol")
+                    if not symbol:
+                        continue
+
+                    period_raw = m.get("funding_period_hours", 8)
+                    try:
+                        period_h = float(period_raw) if period_raw not in (None, "", "?") else 8.0
+                    except (TypeError, ValueError):
+                        period_h = 8.0
+                    if period_h <= 0:
+                        period_h = 8.0
+
+                    markets_meta[symbol] = {
+                        "asset_kind": m.get("asset_kind"),
+                        "funding_period_hours": period_h,
+                        "settlement_currency": m.get("settlement_currency", "USDC"),
+                    }
+                except Exception:
+                    continue
+
+            logger.info("Paradex /markets: загружено %d рынков", len(markets_meta))
+        except requests.exceptions.RequestException as e:
+            logger.warning("Paradex: не удалось получить /markets: %s", e)
+        except Exception as e:
+            logger.warning("Paradex: ошибка при разборе /markets: %s", e)
+
+        # 2) Динамика: /markets/summary?market=ALL
+        try:
+            url_summary = f"{self.paradex_base_url}/markets/summary"
+            params = {"market": "ALL"}
+            resp = requests.get(url_summary, headers=self.paradex_headers, params=params, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            rows = data.get("results", []) or []
+
+            for row in rows:
+                symbol = row.get("symbol")
+                if not symbol:
+                    continue
+
+                meta = markets_meta.get(symbol, {})
+                asset_kind = meta.get("asset_kind")
+
+                # если знаем тип рынка — оставляем только PERP
+                if asset_kind:
+                    try:
+                        if str(asset_kind).upper() != "PERP":
+                            continue
+                    except Exception:
+                        pass
+                else:
+                    # если статики нет — фильтруем по названию (типичный формат: XXX-USD-PERP)
+                    if "-PERP" not in symbol:
+                        continue
+
+                fr_raw = row.get("funding_rate")
+                if fr_raw in (None, "", "?"):
+                    continue
+
+                try:
+                    fr_val = float(fr_raw)
+                except (TypeError, ValueError):
+                    continue
+
+                # В API Paradex funding_rate — доля за период, приводим к “процентам за интервал”
+                rate_percent = fr_val * 100.0
+
+                interval_h = meta.get("funding_period_hours", 8.0)
+                try:
+                    interval_h = float(interval_h)
+                except (TypeError, ValueError):
+                    interval_h = 8.0
+                if interval_h <= 0:
+                    interval_h = 8.0
+
+                settlement = meta.get("settlement_currency", "USDC")
+
+                items.append({
+                    "symbol": symbol,
+                    "exchangeName": "Paradex",
+                    "rate": rate_percent,
+                    "marginType": settlement,
+                    "interval": interval_h,
+                    "nextFundingTime": "",
+                    "stableCoin": settlement,
+                    "source": "paradex_markets_summary",
+                })
+
+            logger.info("Paradex /markets/summary: получено %d записей funding", len(items))
+        except requests.exceptions.RequestException as e:
+            logger.warning("Не удалось получить Paradex /markets/summary: %s", e)
+        except Exception as e:
+            logger.warning("Ошибка при обработке Paradex /markets/summary: %s", e)
+
+        if items:
+            try:
+                syms = sorted({it["symbol"] for it in items if it.get("symbol")})
+                logger.info("Paradex symbols в кэше (первые 20): %s", ", ".join(syms[:20]))
             except Exception:
                 pass
 
@@ -461,8 +629,12 @@ class CryptoArbBot:
             return f"{v:+.5f}%"
 
     def get_exchange_emoji(self, exchange: str) -> str:
-        if isinstance(exchange, str) and exchange.lower() == "hyperliquid":
-            return "🌊"
+        if isinstance(exchange, str):
+            name = exchange.lower()
+            if name == "hyperliquid":
+                return "🌊"
+            if "paradex" in name:
+                return "🌀"
         return "🏦"
 
     async def update_funding_cache(self, context: ContextTypes.DEFAULT_TYPE):
@@ -478,7 +650,7 @@ class CryptoArbBot:
                         len(self.funding_cache),
                     )
                 else:
-                    logger.warning("Не удалось получить данные от Coinglass")
+                    logger.warning("Не удалось получить данные от Coinglass/доп. источников")
             except Exception as e:
                 logger.exception("Критическая ошибка при обновлении кэша: %s", e)
 
@@ -498,10 +670,12 @@ class CryptoArbBot:
         if not data:
             return None
         if funding_type == "negative":
-            filtered = [item for item in data if item.get("rate", 0) <= 0]
+            # только < 0, нули убираем
+            filtered = [item for item in data if item.get("rate", 0) < 0]
             return sorted(filtered, key=lambda x: x["rate"])
         elif funding_type == "positive":
-            filtered = [item for item in data if item.get("rate", 0) >= 0]
+            # только > 0, нули убираем
+            filtered = [item for item in data if item.get("rate", 0) > 0]
             return sorted(filtered, key=lambda x: x["rate"], reverse=True)
         else:
             return data
@@ -572,7 +746,8 @@ class CryptoArbBot:
             "• Пагинация по 20 записей\n"
             "• Сортировка: отрицательные по мере роста, положительные по мере убывания\n"
             "• Проверка времени выплат в арбитраже\n"
-            "• Кэширование каждые 30 секунд\n\n"
+            "• Кэширование каждые 30 секунд\n"
+            "• Поддержка Hyperliquid и Paradex через нативный API\n\n"
             "Все ставки показываются в <b>процентах годовых (APR)</b>, рассчитанных из текущей ставки за интервал."
         )
         await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="HTML")
@@ -894,7 +1069,7 @@ class CryptoArbBot:
         await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
 
     async def show_exchanges(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Список бирж"""
+        """Список бирж + кнопки по каждой бирже"""
         if update.callback_query:
             send_method = update.callback_query.edit_message_text
         else:
@@ -912,6 +1087,7 @@ class CryptoArbBot:
         response = "<b>🏛️ Все доступные биржи</b>\n\n"
         response += f"📊 Всего бирж: {len(exchanges)}\n\n"
 
+        # Текстовый список бирж
         per_line = 3
         for i in range(0, len(exchanges), per_line):
             line = exchanges[i:i+per_line]
@@ -930,7 +1106,24 @@ class CryptoArbBot:
             cache_time = self.funding_cache_updated_at.strftime("%H:%M:%S")
             response += f"\n🕒 <i>Данные обновлены: {cache_time} UTC</i>"
 
-        keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
+        # Кнопки по биржам
+        keyboard = []
+        row = []
+        for ex in exchanges:
+            row.append(
+                InlineKeyboardButton(
+                    f"{self.get_exchange_emoji(ex)} {ex}",
+                    callback_data=f"nav_exch_{ex}",
+                )
+            )
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+        if row:
+            keyboard.append(row)
+
+        keyboard.append([InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")])
+
         await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
     async def show_price_arbitrage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1015,12 +1208,13 @@ class CryptoArbBot:
             item for item in self.funding_cache
             if isinstance(item.get("exchangeName"), str)
             and item["exchangeName"].lower() == "hyperliquid"
+            and float(item.get("rate") or 0.0) != 0.0  # убрали нулевые фандинги
         ]
 
         if not hl_items:
             msg = (
                 "🌊 <b>Hyperliquid</b>\n\n"
-                "В текущем кэше нет ни одной записи по бирже Hyperliquid.\n\n"
+                "В текущем кэше нет ни одной записи по бирже Hyperliquid с ненулевым фандингом.\n\n"
                 "Возможные причины:\n"
                 "• CoinGlass не отдаёт Hyperliquid на твоём тарифе\n"
                 "• Нативный API Hyperliquid с сервера недоступен (фаервол/блокировка)\n"
@@ -1034,7 +1228,7 @@ class CryptoArbBot:
 
         items_sorted = sorted(
             hl_items,
-            key=lambda x: abs(self.annualize_rate(x.get("rate", 0.0), x.get("interval", 8))),
+            key=lambda x: abs(self.annualize_rate(float(x.get("rate") or 0.0), x.get("interval", 8))),
             reverse=True,
         )
 
@@ -1064,7 +1258,9 @@ class CryptoArbBot:
             annual_rate = self.annualize_rate(raw_rate, interval)
             annual_str = self.format_annual_rate(annual_rate)
 
-            response += f"• <b>{symbol}</b> ({margin_type})\n"
+            emoji = "🟢" if raw_rate > 0 else "🔴" if raw_rate < 0 else "⚪"
+
+            response += f"{emoji} <b>{symbol}</b> ({margin_type})\n"
             response += (
                 f"  💰 {annual_str} | ⏰ интервал: {interval}ч "
                 f"| ставка за интервал: {raw_rate:.6f}%\n\n"
@@ -1102,6 +1298,122 @@ class CryptoArbBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
 
+    async def show_exchange_funding(self, update: Update, context: ContextTypes.DEFAULT_TYPE, exchange_name: str, page: int = 1):
+        """Вывод фандингов по одной бирже с пагинацией (включая Paradex и Hyperliquid)"""
+        if update.callback_query:
+            send_method = update.callback_query.edit_message_text
+        else:
+            send_method = update.message.reply_text
+
+        if not self.funding_cache:
+            await send_method(
+                "⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.",
+                parse_mode="HTML",
+            )
+            return
+
+        ex_items = [
+            item for item in self.funding_cache
+            if isinstance(item.get("exchangeName"), str)
+            and item["exchangeName"].lower() == exchange_name.lower()
+            and float(item.get("rate") or 0.0) != 0.0  # убираем нулевые фандинги
+        ]
+
+        if not ex_items:
+            msg = (
+                f"{self.get_exchange_emoji(exchange_name)} <b>{exchange_name}</b>\n\n"
+                "В текущем кэше нет ни одной записи с ненулевым фандингом по этой бирже."
+            )
+            await send_method(msg, parse_mode="HTML")
+            return
+
+        # Сортируем по абсолютному APR (по модулю)
+        items_sorted = sorted(
+            ex_items,
+            key=lambda x: abs(self.annualize_rate(float(x.get("rate") or 0.0), x.get("interval", 8))),
+            reverse=True,
+        )
+
+        items_per_page = 20
+        total_items = len(items_sorted)
+        total_pages = (total_items + items_per_page - 1) // items_per_page
+        page = max(1, min(page, total_pages))
+        start_idx = (page - 1) * items_per_page
+        end_idx = start_idx + items_per_page
+        page_data = items_sorted[start_idx:end_idx]
+
+        context.user_data.update({
+            "current_page": page,
+            "total_pages": total_pages,
+            "current_data_type": "exchange",
+            "current_exchange_name": exchange_name,
+        })
+
+        ex_emoji = self.get_exchange_emoji(exchange_name)
+        response = f"{ex_emoji} <b>{exchange_name}: funding (APR)</b>\n\n"
+        response += f"📊 Всего записей: {total_items} | Страница {page}/{total_pages}\n"
+        response += "💡 Показаны только ненулевые ставки, пересчитанные в годовые (APR).\n\n"
+
+        for item in page_data:
+            symbol = item.get("symbol", "N/A")
+            raw_rate = float(item.get("rate") or 0.0)
+            interval = item.get("interval", 8)
+            margin_type = item.get("marginType", "USDT")
+            annual_rate = self.annualize_rate(raw_rate, interval)
+            annual_str = self.format_annual_rate(annual_rate)
+
+            emoji = "🟢" if raw_rate > 0 else "🔴" if raw_rate < 0 else "⚪"
+
+            response += f"{emoji} <b>{symbol}</b> ({margin_type})\n"
+            response += (
+                f"  💰 {annual_str} | ⏰ интервал: {interval}ч "
+                f"| ставка за интервал: {raw_rate:.6f}%\n\n"
+            )
+
+        keyboard = []
+        if total_pages > 1:
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(
+                    InlineKeyboardButton(
+                        "◀ Назад",
+                        callback_data=f"page_exch_{page-1}_{exchange_name}",
+                    )
+                )
+            nav_buttons.append(
+                InlineKeyboardButton(
+                    f"📄 {page}/{total_pages}",
+                    callback_data="page_exch_info",
+                )
+            )
+            if page < total_pages:
+                nav_buttons.append(
+                    InlineKeyboardButton(
+                        "Вперёд ▶",
+                        callback_data=f"page_exch_{page+1}_{exchange_name}",
+                    )
+                )
+            keyboard.append(nav_buttons)
+
+            if total_pages > 5:
+                quick_pages = set([1, max(1, page - 2), page, min(total_pages, page + 2), total_pages])
+                quick_row = []
+                for p in sorted(quick_pages):
+                    if p == page:
+                        continue
+                    quick_row.append(
+                        InlineKeyboardButton(
+                            str(p),
+                            callback_data=f"page_exch_{p}_{exchange_name}",
+                        )
+                    )
+                if quick_row:
+                    keyboard.append(quick_row)
+
+        keyboard.append([InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
+
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
@@ -1118,6 +1430,15 @@ class CryptoArbBot:
                         await self.show_hyperliquid(update, context, page)
                     elif page_type == "arb":
                         await self.show_arbitrage_bundles(update, context, page)
+                elif len(parts) >= 4:
+                    page_type = parts[1]
+                    if page_type == "exch":
+                        try:
+                            page = int(parts[2])
+                        except ValueError:
+                            page = 1
+                        exchange_name = "_".join(parts[3:])
+                        await self.show_exchange_funding(update, context, exchange_name, page)
             elif data.startswith("nav_"):
                 parts = data.split("_")
                 nav_type = parts[1]
@@ -1139,6 +1460,9 @@ class CryptoArbBot:
                     await self.show_status(update, context)
                 elif nav_type == "hyperliquid":
                     await self.show_hyperliquid(update, context, 1)
+                elif nav_type == "exch" and len(parts) >= 3:
+                    exchange_name = "_".join(parts[2:])
+                    await self.show_exchange_funding(update, context, exchange_name, 1)
         except Exception as e:
             logger.error("Ошибка в обработчике кнопок: %s", e)
             try:
@@ -1167,6 +1491,11 @@ class CryptoArbBot:
                     if data_type == "arbitrage":
                         await self.show_arbitrage_bundles(update, context, page_num)
                         return
+                    if data_type == "exchange":
+                        exchange_name = user_data.get("current_exchange_name")
+                        if exchange_name:
+                            await self.show_exchange_funding(update, context, exchange_name, page_num)
+                            return
                 else:
                     await update.message.reply_text(
                         f"⚠️ Страница должна быть от 1 до {total_pages}"
