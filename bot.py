@@ -6,8 +6,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 # Токены
-TELEGRAM_TOKEN = "8329955590:AAGk1Nu1LUHhBWQ7bqeorTctzhxie69Wzf0"
-COINGLASS_TOKEN = "2d73a05799f64daab80329868a5264ea"
+TELEGRAM_TOKEN = "TELEGRAM_TOKEN_REPLACE_ME"
+COINGLASS_TOKEN = "COINGLASS_TOKEN_REPLACE_ME"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -78,7 +78,7 @@ class CoinglassAPI:
                     stable_list = entry.get("stablecoin_margin_list") or []
                     token_list = entry.get("token_margin_list") or []
                     
-                    # USDT/USDC/другие стейбл-маржи
+                    # Стейбл-маржа (USDT/USDC и т.д.)
                     for row in stable_list:
                         try:
                             rate = float(row.get("funding_rate", 0.0))
@@ -87,14 +87,12 @@ class CoinglassAPI:
 
                         interval = self._normalize_interval(row.get("funding_rate_interval"))
 
-                        # В ответе v4 нет реального типа стейблкойна, поэтому пишем STABLE
                         stable_coin_upper = "STABLE"
 
                         item = {
                             "symbol": sym,
                             "exchangeName": row.get("exchange", ""),
-                            # funding_rate уже в процентах за интервал (0.01 = 0.01%)
-                            "rate": rate,
+                            "rate": rate,  # проценты за интервал
                             "marginType": stable_coin_upper,
                             "interval": interval,
                             "nextFundingTime": row.get("next_funding_time", ""),
@@ -138,7 +136,7 @@ class CoinglassAPI:
                 except Exception as log_ex:
                     logger.warning("Не удалось залогировать список бирж: %s", log_ex)
 
-                # 🔹 ДОБАВЛЯЕМ Hyperliquid НАПРЯМУЮ (если API доступен)
+                # Дополнительно пробуем загрузить Hyperliquid напрямую
                 try:
                     hl_items = self._get_hyperliquid_funding()
                     if hl_items:
@@ -383,8 +381,7 @@ class CoinglassAPI:
                 continue
                 
             margin_type = item.get("marginType", "USDT")
-            # 👇 БЫЛО строго: if margin_type != "USDT": continue
-            # Сейчас допускаем USDT, USDC, USD и общий STABLE
+            # Допускаем USDT, USDC, USD и общий STABLE
             if str(margin_type).upper() not in ("USDT", "USDC", "USD", "STABLE"):
                 continue
                 
@@ -520,10 +517,8 @@ class CryptoArbBot:
         """
         Фильтрация и сортировка данных по типу.
 
-        • Для отрицательных фандингов: сортировка по мере роста (от самых
-          больших минусов к меньшим, т.е. -100% -> -1% -> -0.1% ...)
+        • Для отрицательных фандингов: сортировка по мере роста
         • Для положительных фандингов: сортировка по мере убывания
-          (от самых больших плюсов к меньшим, т.е. 100% -> 10% -> 1% ...)
         """
         data = self.get_cached_funding()
         if not data:
@@ -698,17 +693,17 @@ class CryptoArbBot:
                 nav_buttons.append(InlineKeyboardButton("◀ Назад", callback_data=f"page_{funding_type}_{page-1}"))
             nav_buttons.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="page_info"))
             if page < total_pages:
-                nav_buttons.append(InlineKeyboardButton("Вперед ▶", callback_data=f"page_{funding_type}_{page+1}"))
+                nav_buttons.append(InlineKeyboardButton("Вперёд ▶", callback_data=f"page_{funding_type}_{page+1}"))
             keyboard.append(nav_buttons)
 
-        quick_nav = []
-        if total_pages > 5:
-            quick_pages = set([1, max(1, page-2), page, min(total_pages, page+2), total_pages])
-            for quick_page in sorted(quick_pages):
-                if quick_page != page:
-                    quick_nav.append(InlineKeyboardButton(str(quick_page), callback_data=f"page_{funding_type}_{quick_page}"))
-            if quick_nav:
-                keyboard.append(quick_nav)
+            if total_pages > 5:
+                quick_pages = set([1, max(1, page-2), page, min(total_pages, page+2), total_pages])
+                quick_nav = []
+                for quick_page in sorted(quick_pages):
+                    if quick_page != page:
+                        quick_nav.append(InlineKeyboardButton(str(quick_page), callback_data=f"page_{funding_type}_{quick_page}"))
+                if quick_nav:
+                    keyboard.append(quick_nav)
 
         keyboard.append([InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")])
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -762,14 +757,13 @@ class CryptoArbBot:
                 f"({ex_emoji} {exchange}, интервал: {interval}ч, ставка за интервал: {raw_rate:.6f}%)\n"
             )
 
-        # 🔹 Дополнительный блок: только Hyperliquid
+        # Блок по Hyperliquid
         hl_items = [
             item for item in self.funding_cache
             if isinstance(item.get("exchangeName"), str)
             and item["exchangeName"].lower() == "hyperliquid"
         ]
         if hl_items:
-            # сортируем по годовой ставке
             hl_sorted_pos = sorted(
                 [it for it in hl_items if it.get("rate", 0) > 0],
                 key=lambda x: self.annualize_rate(x.get("rate", 0), x.get("interval", 8)),
@@ -789,7 +783,10 @@ class CryptoArbBot:
                     raw_rate = it.get("rate", 0)
                     ann = self.annualize_rate(raw_rate, interval)
                     ann_str = self.format_annual_rate(ann)
-                    response += f"   • <b>{symbol}</b> — {ann_str} годовых (ставка за интервал: {raw_rate:.6f}%, {interval}ч)\n"
+                    response += (
+                        f"   • <b>{symbol}</b> — {ann_str} годовых "
+                        f"(ставка за интервал: {raw_rate:.6f}%, {interval}ч)\n"
+                    )
             if hl_sorted_neg:
                 response += "  🔴 <i>Отрицательные (топ 5):</i>\n"
                 for it in hl_sorted_neg:
@@ -798,7 +795,10 @@ class CryptoArbBot:
                     raw_rate = it.get("rate", 0)
                     ann = self.annualize_rate(raw_rate, interval)
                     ann_str = self.format_annual_rate(ann)
-                    response += f"   • <b>{symbol}</b> — {ann_str} годовых (ставка за интервал: {raw_rate:.6f}%, {interval}ч)\n"
+                    response += (
+                        f"   • <b>{symbol}</b> — {ann_str} годовых "
+                        f"(ставка за интервал: {raw_rate:.6f}%, {interval}ч)\n"
+                    )
 
         if self.funding_cache_updated_at:
             cache_time = self.funding_cache_updated_at.strftime("%H:%M:%S")
@@ -826,10 +826,7 @@ class CryptoArbBot:
 
             rate = item.get("rate", 0)
 
-            if symbol not in symbol_data:
-                symbol_data[symbol] = []
-
-            symbol_data[symbol].append({
+            symbol_data.setdefault(symbol, []).append({
                 'exchange': item.get("exchangeName", ""),
                 'rate': rate,
                 'interval': item.get("interval", 8),
@@ -894,7 +891,6 @@ class CryptoArbBot:
                 max_annual_str = self.format_annual_rate(max_annual)
                 spread_annual_str = self.format_annual_rate(spread_annual)
 
-                # помечаем связки, где участвует Hyperliquid
                 hl_mark = ""
                 if isinstance(opp['min_exchange'], str) and opp['min_exchange'].lower() == "hyperliquid":
                     hl_mark = " 🌊"
@@ -954,7 +950,6 @@ class CryptoArbBot:
         unique_symbols = len(set(item.get('symbol', '') for item in self.funding_cache))
         total_records = len(self.funding_cache)
 
-        # отдельная статистика по Hyperliquid
         hl_items = [
             item for item in self.funding_cache
             if isinstance(item.get("exchangeName"), str)
@@ -963,7 +958,7 @@ class CryptoArbBot:
         hl_count = len(hl_items)
         hl_symbols = len(set(item.get('symbol', '') for item in hl_items))
 
-        response += f"\n📈 <b>Статистика данных:</b>\n"
+        response += "\n📈 <b>Статистика данных:</b>\n"
         response += f"• Всего записей: {total_records}\n"
         response += f"• Уникальных пар: {unique_symbols}\n"
         response += f"• Бирж: {len(exchanges)}\n"
@@ -1051,12 +1046,12 @@ class CryptoArbBot:
         )
 
         response += (
-            f"<b>🌊 Hyperliquid:</b>\n"
+            "<b>🌊 Hyperliquid:</b>\n"
             f"• Записей: {hl_count}\n"
             f"• Уникальных пар: {hl_symbols}\n"
             f"• Средняя APR: {self.format_annual_rate(avg_hl_ann)}\n\n"
-            f"<i>Кэш обновляется каждые 30 секунд. Доходность в интерфейсе показана в годовых процентах (APR), "
-            f"исходя из последней ставки за интервал.</i>"
+            "<i>Кэш обновляется каждые 30 секунд. Доходность в интерфейсе показана в годовых процентах (APR), "
+            "исходя из последней ставки за интервал.</i>"
         )
 
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
@@ -1087,4 +1082,207 @@ class CryptoArbBot:
                 "🌊 <b>Hyperliquid</b>\n\n"
                 "В текущем кэше нет ни одной записи по бирже Hyperliquid.\n\n"
                 "Возможные причины:\n"
-                "•
+                "• CoinGlass не отдаёт Hyperliquid на твоём тарифе\n"
+                "• Нативный API Hyperliquid с сервера недоступен (фаервол/блокировка)\n"
+                "• Временная ошибка сетевого запроса\n\n"
+                "<i>Посмотри логи приложения: там должны быть строки "
+                "\"Hyperliquid metaAndAssetCtxs\" или \"Hyperliquid predictedFundings\" "
+                "с количеством записей.</i>"
+            )
+            await send_method(msg, parse_mode="HTML")
+            return
+
+        # Сортируем по модулю годовой доходности (APR)
+        items_sorted = sorted(
+            hl_items,
+            key=lambda x: abs(self.annualize_rate(x.get("rate", 0.0), x.get("interval", 8))),
+            reverse=True,
+        )
+
+        items_per_page = 30
+        total_items = len(items_sorted)
+        total_pages = (total_items + items_per_page - 1) // items_per_page
+        page = max(1, min(page, total_pages))
+        start_idx = (page - 1) * items_per_page
+        end_idx = start_idx + items_per_page
+        page_data = items_sorted[start_idx:end_idx]
+
+        # Сохраняем состояние для ввода номера страницы
+        context.user_data.update({
+            'current_page': page,
+            'total_pages': total_pages,
+            'current_data_type': 'hyperliquid',
+        })
+
+        response = "🌊 <b>Hyperliquid: funding (APR)</b>\n\n"
+        response += f"📊 Всего записей: {total_items} | Страница {page}/{total_pages}\n"
+        response += "💡 Ставки показаны как <b>годовые (APR)</b>, рассчитанные из текущей ставки за 8ч.\n\n"
+
+        for item in page_data:
+            symbol = item.get("symbol", "N/A")
+            raw_rate = float(item.get("rate", 0) or 0.0)
+            interval = item.get("interval", 8)
+            margin_type = item.get("marginType", "USDC")
+            annual_rate = self.annualize_rate(raw_rate, interval)
+            annual_str = self.format_annual_rate(annual_rate)
+
+            response += f"• <b>{symbol}</b> ({margin_type})\n"
+            response += (
+                f"  💰 {annual_str} | ⏰ интервал: {interval}ч "
+                f"| ставка за интервал: {raw_rate:.6f}%\n\n"
+            )
+
+        # Клавиатура пагинации
+        keyboard = []
+        if total_pages > 1:
+            nav_buttons = []
+            if page > 1:
+                nav_buttons.append(InlineKeyboardButton("◀ Назад", callback_data=f"page_hl_{page-1}"))
+            nav_buttons.append(InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data="page_hl_info"))
+            if page < total_pages:
+                nav_buttons.append(InlineKeyboardButton("Вперёд ▶", callback_data=f"page_hl_{page+1}"))
+            keyboard.append(nav_buttons)
+
+            if total_pages > 5:
+                quick_pages = set([1, max(1, page-2), page, min(total_pages, page+2), total_pages])
+                quick_row = []
+                for p in sorted(quick_pages):
+                    if p == page:
+                        continue
+                    quick_row.append(InlineKeyboardButton(str(p), callback_data=f"page_hl_{p}"))
+                if quick_row:
+                    keyboard.append(quick_row)
+
+        keyboard.append([InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
+
+    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик инлайн-кнопок"""
+        query = update.callback_query
+        await query.answer()
+
+        try:
+            data = query.data
+            if data.startswith("page_"):
+                parts = data.split("_")
+                if len(parts) == 3:
+                    page_type = parts[1]
+                    page = int(parts[2])
+                    if page_type in ("negative", "positive"):
+                        await self.show_funding_page(update, context, page_type, page)
+                    elif page_type == "hl":
+                        await self.show_hyperliquid(update, context, page)
+            elif data.startswith("nav_"):
+                parts = data.split("_")
+                nav_type = parts[1]
+                if nav_type == "main":
+                    await self.show_main_menu(update, context)
+                elif nav_type == "negative":
+                    await self.show_funding_page(update, context, "negative", 1)
+                elif nav_type == "positive":
+                    await self.show_funding_page(update, context, "positive", 1)
+                elif nav_type == "top10":
+                    await self.show_top10(update, context)
+                elif nav_type == "arbitrage":
+                    await self.show_arbitrage_bundles(update, context)
+                elif nav_type == "exchanges":
+                    await self.show_exchanges(update, context)
+                elif nav_type == "price_arb":
+                    await self.show_price_arbitrage(update, context)
+                elif nav_type == "status":
+                    await self.show_status(update, context)
+                elif nav_type == "hyperliquid":
+                    await self.show_hyperliquid(update, context, 1)
+        except Exception as e:
+            logger.error("Ошибка в обработчике кнопок: %s", e)
+            try:
+                await query.edit_message_text("❌ <b>Произошла ошибка</b>\nПопробуйте еще раз.", parse_mode="HTML")
+            except Exception as edit_error:
+                logger.error("Не удалось отредактировать сообщение: %s", edit_error)
+                await context.bot.send_message(
+                    chat_id=query.message.chat_id,
+                    text="❌ <b>Произошла ошибка</b>\nПопробуйте еще раз.",
+                    parse_mode="HTML"
+                )
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик текстовых сообщений (быстрый переход по страницам)"""
+        text = update.message.text.strip()
+        
+        if text.isdigit():
+            page_num = int(text)
+            user_data = context.user_data
+            if 'current_data_type' in user_data and 'total_pages' in user_data:
+                total_pages = user_data['total_pages']
+                data_type = user_data['current_data_type']
+                if 1 <= page_num <= total_pages:
+                    if data_type in ("negative", "positive"):
+                        await self.show_funding_page(update, context, data_type, page_num)
+                        return
+                    if data_type == "hyperliquid":
+                        await self.show_hyperliquid(update, context, page_num)
+                        return
+                else:
+                    await update.message.reply_text(f"⚠️ Страница должна быть от 1 до {total_pages}")
+                    return
+
+        await update.message.reply_text(
+            "ℹ️ <b>Быстрая навигация</b>\n\n"
+            "Введите номер страницы для быстрого перехода\n"
+            "Или используйте команды:\n"
+            "/negative - отрицательные фандинги\n"
+            "/positive - положительные фандинги\n"
+            "/top10 - топ 10 фандингов\n"
+            "/arbitrage_bundles - арбитражные связки\n"
+            "/exchanges - все доступные биржи\n"
+            "/hyperliquid - пары Hyperliquid",
+            parse_mode="HTML"
+        )
+
+    async def show_main_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать главное меню (кнопка назад)"""
+        keyboard = [
+            [InlineKeyboardButton("🔴 Все отрицательные", callback_data="nav_negative_1")],
+            [InlineKeyboardButton("🟢 Все положительные", callback_data="nav_positive_1")],
+            [InlineKeyboardButton("🚀 Топ 10 лучших", callback_data="nav_top10")],
+            [InlineKeyboardButton("⚖️ Связки арбитража", callback_data="nav_arbitrage")],
+            [InlineKeyboardButton("🌊 Hyperliquid", callback_data="nav_hyperliquid")],
+            [InlineKeyboardButton("🏛️ Все биржи", callback_data="nav_exchanges")],
+            [InlineKeyboardButton("💰 Ценовой арбитраж", callback_data="nav_price_arb")],
+            [InlineKeyboardButton("📊 Статус бота", callback_data="nav_status")],
+        ]
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        text = "📋 <b>Главное меню</b>\nВыберите раздел:"
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+        else:
+            await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
+
+    def run(self):
+        """Запуск бота"""
+        print("🤖 Бот запущен...")
+        print("⚡ Кеширование каждые 30 секунд")
+        print("📊 Мониторинг фандингов и арбитража")
+
+        self.application.job_queue.run_repeating(
+            self.update_funding_cache,
+            interval=30,
+            first=0,
+        )
+
+        try:
+            self.application.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES
+            )
+        except Exception as e:
+            logger.error("Ошибка при запуске бота: %s", e)
+            print(f"❌ Критическая ошибка: {e}")
+
+if __name__ == "__main__":
+    bot = CryptoArbBot()
+    bot.run()
