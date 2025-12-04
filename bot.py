@@ -118,6 +118,14 @@ class CoinglassAPI:
                         result.append(item)
                 
                 logger.info("Coinglass v4 funding-rate: получили %d записей", len(result))
+                # 👇 ДОБАВЛЕНО: лог списка бирж, которые реально пришли из API
+                try:
+                    exchanges = sorted({row.get("exchangeName", "") for row in result if row.get("exchangeName")})
+                    logger.info("Биржи, полученные из exchange-list: %s", ", ".join(exchanges))
+                except Exception as log_ex:
+                    logger.warning("Не удалось залогировать список бирж: %s", log_ex)
+                # 👆 ДОБАВЛЕНО (остальной код не трогался)
+
                 return result
                 
             except requests.exceptions.ReadTimeout:
@@ -545,7 +553,6 @@ class CryptoArbBot:
             await send_method("⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.")
             return
 
-        # уже отсортированы как нужно внутри get_filtered_funding
         positive_data = self.get_filtered_funding("positive")[:10]
         negative_data = self.get_filtered_funding("negative")[:10]
 
