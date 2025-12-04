@@ -50,7 +50,7 @@ class CoinglassAPI:
 
     def get_funding_rates(self):
         """
-        Полный запрос всех ставок фандинга с обработкой ошибок
+        Полный запрос всех ставок фандинга с Coinglass + принудительное добавление Hyperliquid
         """
         url = f"{self.base_url_v4}/futures/funding-rate/exchange-list"
         MAX_RETRIES = 3
@@ -87,31 +87,23 @@ class CoinglassAPI:
 
                         interval = self._normalize_interval(row.get("funding_rate_interval"))
 
-                        # 👇 ДОБАВЛЕНО: аккуратно определяем тип стейблкойна
-                        stable_coin = (
-                            row.get("margin_currency")  # возможные варианты названий поля
-                            or row.get("stableCoin")
-                            or row.get("stablecoin")
-                            or row.get("coin")
-                            or "USDT"
-                        )
-                        stable_coin_upper = str(stable_coin).upper()
+                        # В ответе v4 нет реального типа стейблкойна, поэтому пишем STABLE
+                        stable_coin_upper = "STABLE"
 
                         item = {
                             "symbol": sym,
                             "exchangeName": row.get("exchange", ""),
                             # funding_rate уже в процентах за интервал (0.01 = 0.01%)
                             "rate": rate,
-                            # 👇 БЫЛО: "USDT", ТЕПЕРЬ: реальный тип стейблкойна (USDT/USDC/…)
                             "marginType": stable_coin_upper,
                             "interval": interval,
                             "nextFundingTime": row.get("next_funding_time", ""),
-                            # сохраняем отдельно, вдруг пригодится для дебага
                             "stableCoin": stable_coin_upper,
                         }
+                        # print(item)
                         result.append(item)
                     
-                    # COIN маржа
+                    # COIN-маржа
                     for row in token_list:
                         try:
                             rate = float(row.get("funding_rate", 0.0))
@@ -131,36 +123,48 @@ class CoinglassAPI:
                         result.append(item)
                 
                 logger.info("Coinglass v4 funding-rate: получили %d записей", len(result))
-                # (Можно оставить или убрать лог бирж при желании)
+
+                # Лог по биржам из Coinglass
                 try:
-                    exchanges = sorted({row.get("exchangeName", "") for row in result if row.get("exchangeName")})
-                    logger.info("Биржи в кэше funding-rate (только Coinglass): %s", ", ".join(exchanges))
+                    from collections import Counter
+                    ex_counter = Counter(
+                        row.get("exchangeName", "")
+                        for row in result
+                        if row.get("exchangeName")
+                    )
+                    logger.info(
+                        "Биржи в данных Coinglass: %s",
+                        ", ".join(f"{k}:{v}" for k, v in ex_counter.items())
+                    )
                 except Exception as log_ex:
                     logger.warning("Не удалось залогировать список бирж: %s", log_ex)
 
-                # 👇 ДОБАВЛЕНО: если CoinGlass не отдал Hyperliquid — добираем её напрямую
+                # 🔹 ДОБАВЛЯЕМ Hyperliquid НАПРЯМУЮ (если API доступен)
                 try:
-                    has_hl = any(
-                        isinstance(row.get("exchangeName"), str)
-                        and row["exchangeName"].lower() == "hyperliquid"
-                        for row in result
-                    )
-                    if not has_hl:
-                        hl_items = self._get_hyperliquid_funding()
-                        if hl_items:
-                            result.extend(hl_items)
-                            logger.info(
-                                "Hyperliquid добавлен из нативного API Hyperliquid: %d записей",
-                                len(hl_items),
-                            )
-                        else:
-                            logger.info(
-                                "Hyperliquid не найден ни в CoinGlass, ни в нативном API Hyperliquid."
-                            )
+                    hl_items = self._get_hyperliquid_funding()
+                    if hl_items:
+                        existing_keys = {
+                            (str(row.get("symbol")), str(row.get("exchangeName")).lower())
+                            for row in result
+                        }
+                        added = 0
+                        for it in hl_items:
+                            key = (str(it.get("symbol")), str(it.get("exchangeName")).lower())
+                            if key in existing_keys:
+                                continue
+                            result.append(it)
+                            existing_keys.add(key)
+                            added += 1
+                        logger.info(
+                            "Hyperliquid: добавлено %d новых записей в общий кэш фандинга",
+                            added,
+                        )
                     else:
-                        logger.info("Hyperliquid уже присутствует в данных CoinGlass.")
+                        logger.info(
+                            "Hyperliquid: не удалось получить данные из нативного API (0 записей)"
+                        )
                 except Exception as hl_ex:
-                    logger.warning("Ошибка при дополнительной загрузке Hyperliquid: %s", hl_ex)
+                    logger.warning("Ошибка при добавлении данных Hyperliquid: %s", hl_ex)
 
                 return result
                 
@@ -179,78 +183,135 @@ class CoinglassAPI:
     def _get_hyperliquid_funding(self):
         """
         Дополнительная загрузка ставок фандинга с биржи Hyperliquid напрямую.
-        Нужна на случай, если CoinGlass не отдаёт Hyperliquid
-        в /futures/funding-rate/exchange-list (ограничения тарифа и т.п.).
-        """
-        url = "https://api.hyperliquid.xyz/info"
-        payload = {"type": "metaAndAssetCtxs"}
 
+        1) Пытаемся взять текущий funding через metaAndAssetCtxs
+        2) Если не получилось — пробуем predictedFundings и берём только venue HlPerp
+        """
+        items = []
+
+        # 1) metaAndAssetCtxs — текущий funding на Hyperliquid
         try:
-            resp = requests.post(
-                url,
-                json=payload,
-                timeout=10,
-            )
+            url = "https://api.hyperliquid.xyz/info"
+            payload = {"type": "metaAndAssetCtxs"}
+            resp = requests.post(url, json=payload, timeout=10)
             resp.raise_for_status()
             data = resp.json()
+
+            if isinstance(data, list) and len(data) >= 2:
+                meta = data[0] or {}
+                ctx_list = data[1] or []
+                universe = meta.get("universe", [])
+
+                if isinstance(universe, list) and isinstance(ctx_list, list):
+                    n = min(len(universe), len(ctx_list))
+                    for i in range(n):
+                        u = universe[i] or {}
+                        ctx = ctx_list[i] or {}
+                        symbol = u.get("name")
+                        if not symbol:
+                            continue
+
+                        funding_raw = ctx.get("funding")
+                        if funding_raw in (None, "", "?"):
+                            continue
+
+                        try:
+                            funding = float(funding_raw)
+                        except (TypeError, ValueError):
+                            continue
+
+                        # funding — доля за 8ч, переводим в проценты за интервал
+                        rate_percent = funding * 100.0
+
+                        items.append({
+                            "symbol": symbol,
+                            "exchangeName": "Hyperliquid",
+                            "rate": rate_percent,           # % за 8ч
+                            "marginType": "USDC",           # Hyperliquid — USDC маржа
+                            "interval": 8,
+                            "nextFundingTime": "",
+                            "stableCoin": "USDC",
+                            "source": "hyperliquid_meta",
+                        })
+
+            logger.info("Hyperliquid metaAndAssetCtxs: %d записей", len(items))
         except requests.exceptions.RequestException as e:
-            logger.warning("Не удалось получить данные Hyperliquid metaAndAssetCtxs: %s", e)
-            return []
+            logger.warning("Не удалось получить Hyperliquid metaAndAssetCtxs: %s", e)
         except Exception as e:
-            logger.warning("Ошибка при разборе ответа Hyperliquid metaAndAssetCtxs: %s", e)
-            return []
+            logger.warning("Ошибка при разборе Hyperliquid metaAndAssetCtxs: %s", e)
 
-        # Ожидаемый формат: [ { "universe": [...] }, [ { "funding": "...", ... }, ... ] ]
-        if not isinstance(data, list) or len(data) < 2:
-            logger.warning("Неожиданный формат ответа Hyperliquid metaAndAssetCtxs: %s", str(data)[:200])
-            return []
-
-        meta = data[0] or {}
-        ctx_list = data[1] or []
-
-        universe = meta.get("universe", [])
-        if not isinstance(universe, list) or not isinstance(ctx_list, list):
-            logger.warning("Неожиданный формат universe/ctx_list в ответе Hyperliquid")
-            return []
-
-        n = min(len(universe), len(ctx_list))
-        if n == 0:
-            return []
-
-        result = []
-        for i in range(n):
-            u = universe[i] or {}
-            ctx = ctx_list[i] or {}
-            symbol = u.get("name")
-            if not symbol:
-                continue
-
-            funding_raw = ctx.get("funding")
-            if funding_raw in (None, "", "?"):
-                continue
-
+        # 2) Если metaAndAssetCtxs не дал ни одной записи — пробуем predictedFundings
+        if not items:
             try:
-                funding = float(funding_raw)
-            except (TypeError, ValueError):
-                continue
+                url = "https://api.hyperliquid.xyz/info"
+                payload = {"type": "predictedFundings"}
+                resp = requests.post(url, json=payload, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
 
-            # funding на Hyperliquid — это ставка за 8 часов в долях (0.01 = 1% за 8ч)
-            # Для бота rate должен быть в процентах за интервал.
-            rate_percent = funding * 100.0
+                # Формат: [ ["AVAX", [ ["BinPerp",{...}], ["HlPerp",{...}], ... ] ], ... ]
+                if isinstance(data, list):
+                    for entry in data:
+                        if not (isinstance(entry, list) and len(entry) == 2):
+                            continue
+                        symbol, venues = entry
+                        if not isinstance(symbol, str):
+                            continue
+                        if not isinstance(venues, list):
+                            continue
 
-            item = {
-                "symbol": symbol,
-                "exchangeName": "Hyperliquid",
-                "rate": rate_percent,
-                "marginType": "USDC",   # Hyperliquid торгует в USDC
-                "interval": 8,
-                "nextFundingTime": "",
-                "stableCoin": "USDC",
-            }
-            result.append(item)
+                        for venue in venues:
+                            if not (isinstance(venue, list) and len(venue) == 2):
+                                continue
+                            venue_name, info = venue
+                            if not isinstance(venue_name, str):
+                                continue
+                            if not isinstance(info, dict):
+                                continue
 
-        logger.info("Hyperliquid metaAndAssetCtxs: собрали %d записей", len(result))
-        return result
+                            # Нас интересует только Hyperliquid venue – HlPerp
+                            if not venue_name.lower().startswith("hl"):
+                                continue
+
+                            fr_raw = info.get("fundingRate")
+                            if fr_raw in (None, "", "?"):
+                                continue
+
+                            try:
+                                fr = float(fr_raw)
+                            except (TypeError, ValueError):
+                                continue
+
+                            # fundingRate тоже нормализован на 8ч, переводим в %
+                            rate_percent = fr * 100.0
+                            interval_hours = 8
+
+                            items.append({
+                                "symbol": symbol,
+                                "exchangeName": "Hyperliquid",
+                                "rate": rate_percent,
+                                "marginType": "USDC",
+                                "interval": interval_hours,
+                                "nextFundingTime": info.get("nextFundingTime", ""),
+                                "stableCoin": "USDC",
+                                "source": "hyperliquid_predicted",
+                            })
+
+                logger.info("Hyperliquid predictedFundings: %d записей", len(items))
+            except requests.exceptions.RequestException as e:
+                logger.warning("Не удалось получить Hyperliquid predictedFundings: %s", e)
+            except Exception as e:
+                logger.warning("Ошибка при разборе Hyperliquid predictedFundings: %s", e)
+
+        # Небольшой лог по символам, чтобы в логах было видно, что именно приехало
+        if items:
+            try:
+                syms = sorted({it["symbol"] for it in items if it.get("symbol")})
+                logger.info("Hyperliquid symbols в кэше (первые 20): %s", ", ".join(syms[:20]))
+            except Exception:
+                pass
+
+        return items
 
     def get_arbitrage_opportunities(self):
         """
@@ -502,6 +563,7 @@ class CryptoArbBot:
             CommandHandler("price_arbitrage", self.show_price_arbitrage),
             CommandHandler("status", self.show_status),
             CommandHandler("exchanges", self.show_exchanges),
+            CommandHandler("hyperliquid", self.show_hyperliquid),
             CallbackQueryHandler(self.button_handler, pattern="^(page_|nav_|funding_)"),
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message),
         ]
@@ -530,6 +592,7 @@ class CryptoArbBot:
             [InlineKeyboardButton("🟢 Все положительные", callback_data="nav_positive_1")],
             [InlineKeyboardButton("🚀 Топ 10 лучших", callback_data="nav_top10")],
             [InlineKeyboardButton("⚖️ Связки арбитража", callback_data="nav_arbitrage")],
+            [InlineKeyboardButton("🌊 Hyperliquid", callback_data="nav_hyperliquid")],
             [InlineKeyboardButton("🏛️ Все биржи", callback_data="nav_exchanges")],
             [InlineKeyboardButton("💰 Ценовой арбитраж", callback_data="nav_price_arb")],
             [InlineKeyboardButton("📊 Статус бота", callback_data="nav_status")],
@@ -546,6 +609,7 @@ class CryptoArbBot:
             "/arbitrage_bundles - связки арбитража фандинга\n"
             "/exchanges - все доступные биржи\n"
             "/price_arbitrage - ценовой арбитраж\n"
+            "/hyperliquid - только пары с биржи Hyperliquid\n"
             "/status - статус бота и кэша\n\n"
             "⚡ Особенности:\n"
             "• Пагинация по 20 записей\n"
@@ -905,6 +969,68 @@ class CryptoArbBot:
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
+    async def show_hyperliquid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Пары только с биржи Hyperliquid"""
+        if update.callback_query:
+            send_method = update.callback_query.edit_message_text
+        else:
+            send_method = update.message.reply_text
+
+        if not self.funding_cache:
+            await send_method(
+                "⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.",
+                parse_mode="HTML",
+            )
+            return
+
+        hl_items = [
+            item for item in self.funding_cache
+            if isinstance(item.get("exchangeName"), str)
+            and item["exchangeName"].lower() == "hyperliquid"
+        ]
+
+        if not hl_items:
+            msg = (
+                "🌊 <b>Hyperliquid</b>\n\n"
+                "В текущем кэше нет ни одной записи по бирже Hyperliquid.\n\n"
+                "Возможные причины:\n"
+                "• CoinGlass не отдаёт Hyperliquid на твоём тарифе\n"
+                "• Нативный API Hyperliquid с сервера недоступен (фаервол/блокировка)\n"
+                "• Временная ошибка сетевого запроса\n\n"
+                "<i>Посмотри логи приложения: там должны быть строки "
+                "\"Hyperliquid metaAndAssetCtxs\" или \"Hyperliquid predictedFundings\" "
+                "с количеством записей.</i>"
+            )
+            await send_method(msg, parse_mode="HTML")
+            return
+
+        # Сортируем по модулю годовой доходности (APR)
+        items_sorted = sorted(
+            hl_items,
+            key=lambda x: abs(self.annualize_rate(x.get("rate", 0.0), x.get("interval", 8))),
+            reverse=True,
+        )
+
+        response = "🌊 <b>Hyperliquid: funding (APR)</b>\n\n"
+        response += f"📊 Всего записей: {len(items_sorted)}\n\n"
+
+        for item in items_sorted[:30]:
+            symbol = item.get("symbol", "N/A")
+            raw_rate = float(item.get("rate", 0) or 0.0)
+            interval = item.get("interval", 8)
+            margin_type = item.get("marginType", "USDC")
+            annual_rate = self.annualize_rate(raw_rate, interval)
+            annual_str = self.format_annual_rate(annual_rate)
+
+            response += f"• <b>{symbol}</b> ({margin_type})\n"
+            response += (
+                f"  💰 {annual_str} | ⏰ интервал: {interval}ч "
+                f"| ставка за интервал: {raw_rate:.6f}%\n\n"
+            )
+
+        keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
+        await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик инлайн-кнопок"""
         query = update.callback_query
@@ -937,6 +1063,8 @@ class CryptoArbBot:
                     await self.show_price_arbitrage(update, context)
                 elif nav_type == "status":
                     await self.show_status(update, context)
+                elif nav_type == "hyperliquid":
+                    await self.show_hyperliquid(update, context)
         except Exception as e:
             logger.error("Ошибка в обработчике кнопок: %s", e)
             try:
@@ -985,6 +1113,7 @@ class CryptoArbBot:
             [InlineKeyboardButton("🟢 Все положительные", callback_data="nav_positive_1")],
             [InlineKeyboardButton("🚀 Топ 10 лучших", callback_data="nav_top10")],
             [InlineKeyboardButton("⚖️ Связки арбитража", callback_data="nav_arbitrage")],
+            [InlineKeyboardButton("🌊 Hyperliquid", callback_data="nav_hyperliquid")],
             [InlineKeyboardButton("🏛️ Все биржи", callback_data="nav_exchanges")],
             [InlineKeyboardButton("💰 Ценовой арбитраж", callback_data="nav_price_arb")],
             [InlineKeyboardButton("📊 Статус бота", callback_data="nav_status")],
