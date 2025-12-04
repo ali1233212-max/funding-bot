@@ -2,7 +2,6 @@ import logging
 import asyncio
 from datetime import datetime, timezone
 import requests
-import json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
@@ -15,73 +14,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-class ExchangeAPI:
-    """API для разных бирж"""
-    
-    @staticmethod
-    def get_hyperliquid_data():
-        """Получение данных с Hyperliquid"""
-        try:
-            url = "https://api.hyperliquid.xyz/info"
-            payload = {
-                "type": "l2Book",
-                "coin": "BTC"
-            }
-            response = requests.post(
-                url,
-                json=payload,
-                headers={'Content-Type': 'application/json'},
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                return {
-                    "exchange": "Hyperliquid",
-                    "data": data,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }
-            else:
-                logger.error(f"Hyperliquid API error: {response.status_code}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error fetching Hyperliquid data: {e}")
-            return None
-    
-    @staticmethod
-    def get_dydx_data():
-        """Получение данных с dYdX"""
-        try:
-            # Получаем список рынков
-            markets_url = "https://api.dydx.exchange/v3/markets"
-            markets_response = requests.get(markets_url, timeout=10)
-            
-            if markets_response.status_code == 200:
-                markets_data = markets_response.json()
-                
-                # Получаем данные об ордерах для BTC-USD
-                orderbook_url = "https://api.dydx.exchange/v3/orderbook/BTC-USD"
-                orderbook_response = requests.get(orderbook_url, timeout=10)
-                
-                orderbook_data = {}
-                if orderbook_response.status_code == 200:
-                    orderbook_data = orderbook_response.json()
-                
-                return {
-                    "exchange": "dYdX",
-                    "markets": markets_data.get("markets", {}),
-                    "orderbook": orderbook_data,
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }
-            else:
-                logger.error(f"dYdX API error: {markets_response.status_code}")
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error fetching dYdX data: {e}")
-            return None
 
 class CoinglassAPI:
     """
@@ -102,7 +34,7 @@ class CoinglassAPI:
     def _normalize_interval(self, val):
         """
         Нормализация интервала фандинга в часы.
-        Если приходит None / "" / "?" или некорректное значение --- ставим 8ч по умолчанию.
+        Если приходит None / "" / "?" или некорректное значение — ставим 8ч по умолчанию.
         """
         try:
             if val in (None, "", "?"):
@@ -152,8 +84,9 @@ class CoinglassAPI:
                             rate = float(row.get("funding_rate", 0.0))
                         except (TypeError, ValueError):
                             rate = 0.0
+
                         interval = self._normalize_interval(row.get("funding_rate_interval"))
-                        
+
                         # 👇 ДОБАВЛЕНО: аккуратно определяем тип стейблкойна
                         stable_coin = (
                             row.get("margin_currency")  # возможные варианты названий поля
@@ -163,13 +96,13 @@ class CoinglassAPI:
                             or "USDT"
                         )
                         stable_coin_upper = str(stable_coin).upper()
-                        
+
                         item = {
                             "symbol": sym,
                             "exchangeName": row.get("exchange", ""),
                             # funding_rate уже в процентах за интервал (0.01 = 0.01%)
                             "rate": rate,
-                            # 👇 БЫЛО: "USDT", ТЕПЕРЬ: реальный тип стейблкойна (USDT/USDC/...)
+                            # 👇 БЫЛО: "USDT", ТЕПЕРЬ: реальный тип стейблкойна (USDT/USDC/…)
                             "marginType": stable_coin_upper,
                             "interval": interval,
                             "nextFundingTime": row.get("next_funding_time", ""),
@@ -184,8 +117,9 @@ class CoinglassAPI:
                             rate = float(row.get("funding_rate", 0.0))
                         except (TypeError, ValueError):
                             rate = 0.0
+
                         interval = self._normalize_interval(row.get("funding_rate_interval"))
-                        
+                            
                         item = {
                             "symbol": sym,
                             "exchangeName": row.get("exchange", ""),
@@ -197,14 +131,37 @@ class CoinglassAPI:
                         result.append(item)
                 
                 logger.info("Coinglass v4 funding-rate: получили %d записей", len(result))
-                
                 # (Можно оставить или убрать лог бирж при желании)
                 try:
                     exchanges = sorted({row.get("exchangeName", "") for row in result if row.get("exchangeName")})
-                    logger.info("Биржи в кэше funding-rate: %s", ", ".join(exchanges))
+                    logger.info("Биржи в кэше funding-rate (только Coinglass): %s", ", ".join(exchanges))
                 except Exception as log_ex:
                     logger.warning("Не удалось залогировать список бирж: %s", log_ex)
-                
+
+                # 👇 ДОБАВЛЕНО: если CoinGlass не отдал Hyperliquid — добираем её напрямую
+                try:
+                    has_hl = any(
+                        isinstance(row.get("exchangeName"), str)
+                        and row["exchangeName"].lower() == "hyperliquid"
+                        for row in result
+                    )
+                    if not has_hl:
+                        hl_items = self._get_hyperliquid_funding()
+                        if hl_items:
+                            result.extend(hl_items)
+                            logger.info(
+                                "Hyperliquid добавлен из нативного API Hyperliquid: %d записей",
+                                len(hl_items),
+                            )
+                        else:
+                            logger.info(
+                                "Hyperliquid не найден ни в CoinGlass, ни в нативном API Hyperliquid."
+                            )
+                    else:
+                        logger.info("Hyperliquid уже присутствует в данных CoinGlass.")
+                except Exception as hl_ex:
+                    logger.warning("Ошибка при дополнительной загрузке Hyperliquid: %s", hl_ex)
+
                 return result
                 
             except requests.exceptions.ReadTimeout:
@@ -219,12 +176,89 @@ class CoinglassAPI:
                 logger.exception("Неожиданная ошибка при запросе к Coinglass v4: %s", e)
                 return None
 
+    def _get_hyperliquid_funding(self):
+        """
+        Дополнительная загрузка ставок фандинга с биржи Hyperliquid напрямую.
+        Нужна на случай, если CoinGlass не отдаёт Hyperliquid
+        в /futures/funding-rate/exchange-list (ограничения тарифа и т.п.).
+        """
+        url = "https://api.hyperliquid.xyz/info"
+        payload = {"type": "metaAndAssetCtxs"}
+
+        try:
+            resp = requests.post(
+                url,
+                json=payload,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.exceptions.RequestException as e:
+            logger.warning("Не удалось получить данные Hyperliquid metaAndAssetCtxs: %s", e)
+            return []
+        except Exception as e:
+            logger.warning("Ошибка при разборе ответа Hyperliquid metaAndAssetCtxs: %s", e)
+            return []
+
+        # Ожидаемый формат: [ { "universe": [...] }, [ { "funding": "...", ... }, ... ] ]
+        if not isinstance(data, list) or len(data) < 2:
+            logger.warning("Неожиданный формат ответа Hyperliquid metaAndAssetCtxs: %s", str(data)[:200])
+            return []
+
+        meta = data[0] or {}
+        ctx_list = data[1] or []
+
+        universe = meta.get("universe", [])
+        if not isinstance(universe, list) or not isinstance(ctx_list, list):
+            logger.warning("Неожиданный формат universe/ctx_list в ответе Hyperliquid")
+            return []
+
+        n = min(len(universe), len(ctx_list))
+        if n == 0:
+            return []
+
+        result = []
+        for i in range(n):
+            u = universe[i] or {}
+            ctx = ctx_list[i] or {}
+            symbol = u.get("name")
+            if not symbol:
+                continue
+
+            funding_raw = ctx.get("funding")
+            if funding_raw in (None, "", "?"):
+                continue
+
+            try:
+                funding = float(funding_raw)
+            except (TypeError, ValueError):
+                continue
+
+            # funding на Hyperliquid — это ставка за 8 часов в долях (0.01 = 1% за 8ч)
+            # Для бота rate должен быть в процентах за интервал.
+            rate_percent = funding * 100.0
+
+            item = {
+                "symbol": symbol,
+                "exchangeName": "Hyperliquid",
+                "rate": rate_percent,
+                "marginType": "USDC",   # Hyperliquid торгует в USDC
+                "interval": 8,
+                "nextFundingTime": "",
+                "stableCoin": "USDC",
+            }
+            result.append(item)
+
+        logger.info("Hyperliquid metaAndAssetCtxs: собрали %d записей", len(result))
+        return result
+
     def get_arbitrage_opportunities(self):
         """
         Арбитраж по цене через v3 API (дополнительная функция)
         """
         url = f"{self.base_url_v3}/futures/market"
         params = {"symbol": "BTC"}
+        
         try:
             response = requests.get(
                 url, headers=self.headers_v3, params=params, timeout=10
@@ -233,8 +267,8 @@ class CoinglassAPI:
                 data = response.json()
                 if data.get("success"):
                     return self._calculate_arbitrage(data.get("data", []))
-                logger.warning("Coinglass v3 futures/market error: %s", response.text)
-                return None
+            logger.warning("Coinglass v3 futures/market error: %s", response.text)
+            return None
         except Exception as e:
             logger.exception(f"Ошибка при запросе к Coinglass v3 futures/market: {e}")
             return None
@@ -254,7 +288,7 @@ class CoinglassAPI:
                     prices_float = [float(p) for p in prices]
                 except Exception:
                     continue
-                
+                    
                 min_price = min(prices_float)
                 max_price = max(prices_float)
                 
@@ -278,45 +312,46 @@ class CoinglassAPI:
         """
         if not funding_items:
             return None
-        
+            
         by_symbol = {}
         for item in funding_items:
             sym = item.get("symbol", "")
             if not sym:
                 continue
+                
             if symbol and sym.upper() != symbol.upper():
                 continue
-            
+                
             margin_type = item.get("marginType", "USDT")
             # 👇 БЫЛО строго: if margin_type != "USDT": continue
             # Сейчас допускаем USDT, USDC, USD и общий STABLE
             if str(margin_type).upper() not in ("USDT", "USDC", "USD", "STABLE"):
                 continue
-            
+                
             rate = item.get("rate", 0)
             exchange = item.get("exchangeName", "")
             if not exchange:
                 continue
-            
+                
             try:
                 r = float(rate)
             except (TypeError, ValueError):
                 continue
-            
+                
             by_symbol.setdefault(sym, []).append((exchange, r))
-        
+            
         opportunities = []
         for sym, ex_rates in by_symbol.items():
             if len(ex_rates) < 2:
                 continue
-            
+                
             min_ex, min_rate = min(ex_rates, key=lambda x: x[1])
             max_ex, max_rate = max(ex_rates, key=lambda x: x[1])
             spread = max_rate - min_rate
             
             if abs(spread) < min_spread:
                 continue
-            
+                
             opportunities.append({
                 "symbol": sym,
                 "min_exchange": min_ex,
@@ -325,37 +360,31 @@ class CoinglassAPI:
                 "max_rate": max_rate,
                 "spread": spread,
             })
-        
+            
         if not opportunities:
             return None
-        
+            
         opportunities.sort(key=lambda x: abs(x["spread"]), reverse=True)
         return opportunities
 
 class CryptoArbBot:
     def __init__(self):
         self.api = CoinglassAPI()
-        self.exchange_api = ExchangeAPI()
         self.application = Application.builder().token(TELEGRAM_TOKEN).build()
-        
-        # Кэши для разных бирж
         self.funding_cache = []
         self.funding_cache_updated_at = None
-        self.hyperliquid_cache = None
-        self.dydx_cache = None
-        self.exchanges_cache_updated_at = None
-        
         self.cache_lock = asyncio.Lock()
+
         # Минимальный модуль ставки (оставлен для возможного дальнейшего использования)
         self.MIN_ABS_RATE = 1e-6
-        
+
         self.setup_handlers()
 
     def annualize_rate(self, rate, interval):
         """
         Перевод ставки фандинга за период в годовую ПРОЦЕНТНУЮ ставку (APR).
-        rate --- в процентах за интервал (0.01 = 0.01%)
-        interval --- длительность интервала в часах
+        rate — в процентах за интервал (0.01 = 0.01%)
+        interval — длительность интервала в часах
         """
         try:
             if interval in (None, "", "?"):
@@ -364,10 +393,10 @@ class CryptoArbBot:
                 hours = float(interval)
         except (TypeError, ValueError):
             hours = 8.0
-        
+
         if hours <= 0:
             hours = 8.0
-        
+
         periods_per_year = 365.0 * 24.0 / hours
         annual_percent = rate * periods_per_year
         return annual_percent
@@ -388,21 +417,9 @@ class CryptoArbBot:
 
     def get_exchange_emoji(self, exchange: str) -> str:
         """
-        Возвращает эмодзи для бирж
+        Один и тот же эмодзи для всех бирж.
         """
-        emoji_map = {
-            "Hyperliquid": "⚡",
-            "dYdX": "🌀",
-            "Binance": "🅱️",
-            "Bybit": "🐯",
-            "OKX": "🆗",
-            "Bitget": "🔧",
-            "Gate": "🚪",
-            "Kucoin": "🔶",
-            "BitMEX": "Ⓜ️",
-            "Deribit": "🎯",
-        }
-        return emoji_map.get(exchange, "🏦")
+        return "🏦"
 
     async def update_funding_cache(self, context: ContextTypes.DEFAULT_TYPE):
         """
@@ -421,51 +438,26 @@ class CryptoArbBot:
             except Exception as e:
                 logger.exception("Критическая ошибка при обновлении кэша: %s", e)
 
-    async def update_exchanges_cache(self, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Обновление данных с Hyperliquid и dYdX
-        """
-        async with self.cache_lock:
-            try:
-                logger.info("Обновление данных с Hyperliquid и dYdX...")
-                
-                # Получаем данные параллельно
-                hyperliquid_data = await asyncio.to_thread(self.exchange_api.get_hyperliquid_data)
-                dydx_data = await asyncio.to_thread(self.exchange_api.get_dydx_data)
-                
-                if hyperliquid_data:
-                    self.hyperliquid_cache = hyperliquid_data
-                    logger.info("Данные Hyperliquid обновлены")
-                
-                if dydx_data:
-                    self.dydx_cache = dydx_data
-                    logger.info("Данные dYdX обновлены")
-                
-                self.exchanges_cache_updated_at = datetime.now(timezone.utc)
-                logger.info("Кэш бирж обновлён")
-                
-            except Exception as e:
-                logger.exception("Ошибка при обновлении данных бирж: %s", e)
-
     def get_cached_funding(self, symbol=None):
         """
         Безопасное получение данных из кэша с фильтрацией по символу
         """
         if not self.funding_cache:
             return None
-        
+            
         if symbol:
             symbol_upper = symbol.upper()
             return [
                 item for item in self.funding_cache
                 if item.get("symbol", "").upper() == symbol_upper
             ]
-        
+            
         return self.funding_cache
 
     def get_filtered_funding(self, funding_type="all"):
         """
         Фильтрация и сортировка данных по типу.
+
         • Для отрицательных фандингов: сортировка по мере роста (от самых
           больших минусов к меньшим, т.е. -100% -> -1% -> -0.1% ...)
         • Для положительных фандингов: сортировка по мере убывания
@@ -474,7 +466,7 @@ class CryptoArbBot:
         data = self.get_cached_funding()
         if not data:
             return None
-        
+            
         if funding_type == "negative":
             filtered = [item for item in data if item.get("rate", 0) <= 0]
             return sorted(filtered, key=lambda x: x["rate"])
@@ -490,13 +482,13 @@ class CryptoArbBot:
         """
         if not self.funding_cache:
             return None
-        
+            
         exchanges = set()
         for item in self.funding_cache:
             exchange = item.get("exchangeName", "")
             if exchange:
                 exchanges.add(exchange)
-        
+                
         return sorted(list(exchanges))
 
     def setup_handlers(self):
@@ -510,16 +502,13 @@ class CryptoArbBot:
             CommandHandler("price_arbitrage", self.show_price_arbitrage),
             CommandHandler("status", self.show_status),
             CommandHandler("exchanges", self.show_exchanges),
-            CommandHandler("hyperliquid", self.show_hyperliquid),
-            CommandHandler("dydx", self.show_dydx),
-            CommandHandler("all_exchanges", self.show_all_exchanges_data),
-            CallbackQueryHandler(self.button_handler, pattern="^(page_|nav_|funding_|exchange_)"),
+            CallbackQueryHandler(self.button_handler, pattern="^(page_|nav_|funding_)"),
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message),
         ]
         
         for handler in handlers:
             self.application.add_handler(handler)
-        
+
         self.application.add_error_handler(self.error_handler)
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -544,9 +533,6 @@ class CryptoArbBot:
             [InlineKeyboardButton("🏛️ Все биржи", callback_data="nav_exchanges")],
             [InlineKeyboardButton("💰 Ценовой арбитраж", callback_data="nav_price_arb")],
             [InlineKeyboardButton("📊 Статус бота", callback_data="nav_status")],
-            [InlineKeyboardButton("⚡ Hyperliquid", callback_data="exchange_hyperliquid")],
-            [InlineKeyboardButton("🌀 dYdX", callback_data="exchange_dydx")],
-            [InlineKeyboardButton("📈 Все данные бирж", callback_data="exchange_all")],
         ]
         
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -560,10 +546,7 @@ class CryptoArbBot:
             "/arbitrage_bundles - связки арбитража фандинга\n"
             "/exchanges - все доступные биржи\n"
             "/price_arbitrage - ценовой арбитраж\n"
-            "/status - статус бота и кэша\n"
-            "/hyperliquid - данные с Hyperliquid\n"
-            "/dydx - данные с dYdX\n"
-            "/all_exchanges - данные со всех бирж\n\n"
+            "/status - статус бота и кэша\n\n"
             "⚡ Особенности:\n"
             "• Пагинация по 20 записей\n"
             "• Сортировка: отрицательные по мере роста, положительные по мере убывания\n"
@@ -573,190 +556,6 @@ class CryptoArbBot:
         )
         
         await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="HTML")
-
-    async def show_hyperliquid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать данные с Hyperliquid"""
-        if update.callback_query:
-            send_method = update.callback_query.edit_message_text
-        else:
-            send_method = update.message.reply_text
-        
-        await send_method("⚡ <b>Получение данных с Hyperliquid...</b>", parse_mode="HTML")
-        
-        if not self.hyperliquid_cache:
-            # Попробуем получить данные сразу
-            data = await asyncio.to_thread(self.exchange_api.get_hyperliquid_data)
-            if not data:
-                await send_method(
-                    "❌ <b>Не удалось получить данные с Hyperliquid</b>\n\n"
-                    "Возможные причины:\n"
-                    "• Проблемы с API Hyperliquid\n"
-                    "• Сеть недоступна\n"
-                    "• Превышены лимиты запросов",
-                    parse_mode="HTML"
-                )
-                return
-            self.hyperliquid_cache = data
-        
-        data = self.hyperliquid_cache
-        response = "⚡ <b>Hyperliquid Data</b>\n\n"
-        
-        if "data" in data and "levels" in data["data"]:
-            levels = data["data"]["levels"]
-            response += f"📊 <b>Order Book Levels:</b> {len(levels)}\n\n"
-            
-            if levels:
-                # Показываем первые 10 уровней
-                for i, level in enumerate(levels[:10]):
-                    price = level.get("px", "N/A")
-                    size = level.get("sz", "N/A")
-                    response += f"{i+1}. Цена: {price} | Объем: {size}\n"
-            
-            response += f"\n⏰ <i>Обновлено: {data.get('timestamp', 'N/A')}</i>"
-        else:
-            response += "📭 Нет данных о стакане заявок\n"
-        
-        keyboard = [
-            [InlineKeyboardButton("🔄 Обновить", callback_data="exchange_hyperliquid_refresh")],
-            [InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]
-        ]
-        
-        await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-
-    async def show_dydx(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать данные с dYdX"""
-        if update.callback_query:
-            send_method = update.callback_query.edit_message_text
-        else:
-            send_method = update.message.reply_text
-        
-        await send_method("🌀 <b>Получение данных с dYdX...</b>", parse_mode="HTML")
-        
-        if not self.dydx_cache:
-            # Попробуем получить данные сразу
-            data = await asyncio.to_thread(self.exchange_api.get_dydx_data)
-            if not data:
-                await send_method(
-                    "❌ <b>Не удалось получить данные с dYdX</b>\n\n"
-                    "Возможные причины:\n"
-                    "• Проблемы с API dYdX\n"
-                    "• Сеть недоступна\n"
-                    "• Превышены лимиты запросов",
-                    parse_mode="HTML"
-                )
-                return
-            self.dydx_cache = data
-        
-        data = self.dydx_cache
-        response = "🌀 <b>dYdX Data</b>\n\n"
-        
-        # Показываем информацию о рынках
-        if "markets" in data:
-            markets = data["markets"]
-            btc_market = markets.get("BTC-USD", {})
-            
-            if btc_market:
-                response += "🎯 <b>BTC-USD Market</b>\n"
-                response += f"• Статус: {btc_market.get('status', 'N/A')}\n"
-                response += f"• Цена: ${btc_market.get('oraclePrice', 'N/A')}\n"
-                response += f"• Объем 24ч: ${btc_market.get('volume24H', 'N/A'):,.2f}\n"
-                response += f"• Изменение 24ч: {btc_market.get('priceChange24H', 'N/A')}%\n"
-                response += f"• Открытый интерес: {btc_market.get('openInterest', 'N/A')}\n\n"
-        
-        # Показываем информацию о стакане заявок
-        if "orderbook" in data and "asks" in data["orderbook"] and "bids" in data["orderbook"]:
-            orderbook = data["orderbook"]
-            asks = orderbook.get("asks", [])[:5]  # Первые 5 ask
-            bids = orderbook.get("bids", [])[:5]  # Первые 5 bid
-            
-            response += "📊 <b>Order Book (Top 5)</b>\n"
-            response += "🔴 <b>Asks (продажа):</b>\n"
-            for i, ask in enumerate(asks):
-                price = ask.get("price", "N/A")
-                size = ask.get("size", "N/A")
-                response += f"  {price} | {size}\n"
-            
-            response += "\n🟢 <b>Bids (покупка):</b>\n"
-            for i, bid in enumerate(bids):
-                price = bid.get("price", "N/A")
-                size = bid.get("size", "N/A")
-                response += f"  {price} | {size}\n"
-        
-        response += f"\n⏰ <i>Обновлено: {data.get('timestamp', 'N/A')}</i>"
-        
-        keyboard = [
-            [InlineKeyboardButton("🔄 Обновить", callback_data="exchange_dydx_refresh")],
-            [InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]
-        ]
-        
-        await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-
-    async def show_all_exchanges_data(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать данные со всех бирж"""
-        if update.callback_query:
-            send_method = update.callback_query.edit_message_text
-        else:
-            send_method = update.message.reply_text
-        
-        await send_method("📈 <b>Сбор данных со всех бирж...</b>", parse_mode="HTML")
-        
-        response = "📈 <b>Данные со всех бирж</b>\n\n"
-        
-        # 1. Данные Coinglass
-        if self.funding_cache:
-            unique_exchanges = len(set([item.get("exchangeName", "") for item in self.funding_cache]))
-            response += f"🏛️ <b>Coinglass Data:</b>\n"
-            response += f"• Бирж в кэше: {unique_exchanges}\n"
-            response += f"• Всего записей: {len(self.funding_cache)}\n"
-            if self.funding_cache_updated_at:
-                cache_time = self.funding_cache_updated_at.strftime("%H:%M:%S")
-                response += f"• Обновлено: {cache_time} UTC\n"
-            response += "\n"
-        else:
-            response += "🏛️ <b>Coinglass:</b> Нет данных\n\n"
-        
-        # 2. Данные Hyperliquid
-        if not self.hyperliquid_cache:
-            hyperliquid_data = await asyncio.to_thread(self.exchange_api.get_hyperliquid_data)
-            if hyperliquid_data:
-                self.hyperliquid_cache = hyperliquid_data
-        
-        if self.hyperliquid_cache:
-            response += "⚡ <b>Hyperliquid:</b> Данные загружены\n"
-            if "data" in self.hyperliquid_cache and "levels" in self.hyperliquid_cache["data"]:
-                levels = len(self.hyperliquid_cache["data"]["levels"])
-                response += f"• Уровней в стакане: {levels}\n"
-            response += "\n"
-        else:
-            response += "⚡ <b>Hyperliquid:</b> Нет данных\n\n"
-        
-        # 3. Данные dYdX
-        if not self.dydx_cache:
-            dydx_data = await asyncio.to_thread(self.exchange_api.get_dydx_data)
-            if dydx_data:
-                self.dydx_cache = dydx_data
-        
-        if self.dydx_cache:
-            response += "🌀 <b>dYdX:</b> Данные загружены\n"
-            if "markets" in self.dydx_cache:
-                markets_count = len(self.dydx_cache.get("markets", {}))
-                response += f"• Доступных рынков: {markets_count}\n"
-            response += "\n"
-        else:
-            response += "🌀 <b>dYdX:</b> Нет данных\n\n"
-        
-        response += "💡 <i>Используйте соответствующие команды для детальной информации по каждой бирже.</i>"
-        
-        keyboard = [
-            [
-                InlineKeyboardButton("⚡ Hyperliquid", callback_data="exchange_hyperliquid"),
-                InlineKeyboardButton("🌀 dYdX", callback_data="exchange_dydx")
-            ],
-            [InlineKeyboardButton("🏛️ Coinglass", callback_data="nav_exchanges")],
-            [InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]
-        ]
-        
-        await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
     async def show_negative(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await self.show_funding_page(update, context, "negative", 1)
@@ -770,7 +569,7 @@ class CryptoArbBot:
             send_method = update.callback_query.edit_message_text
         else:
             send_method = update.message.reply_text
-        
+
         if not self.funding_cache:
             error_msg = (
                 "⚠️ <b>Данные ещё не загружены</b>\n\n"
@@ -782,54 +581,52 @@ class CryptoArbBot:
             )
             await send_method(error_msg, parse_mode="HTML")
             return
-        
+
         filtered_data = self.get_filtered_funding(funding_type)
         if not filtered_data:
             await send_method("🤷‍♂️ <b>Нет данных для отображения</b>\n\nПопробуйте другой раздел.", parse_mode="HTML")
             return
-        
+
         items_per_page = 20
         total_items = len(filtered_data)
         total_pages = (total_items + items_per_page - 1) // items_per_page
         page = max(1, min(page, total_pages))
-        
         start_idx = (page - 1) * items_per_page
         end_idx = start_idx + items_per_page
         page_data = filtered_data[start_idx:end_idx]
-        
+
         context.user_data.update({
             'current_page': page,
             'total_pages': total_pages,
             'current_data_type': funding_type,
             'current_data': filtered_data
         })
-        
+
         title_map = {
             "negative": "🔴 Отрицательные фандинги",
             "positive": "🟢 Положительные фандинги"
         }
-        
         response = f"<b>{title_map[funding_type]} (APR)</b>\n"
         response += f"📄 Страница {page}/{total_pages} | Всего записей: {total_items}\n"
         response += "💡 Показана приблизительная <b>годовая доходность (APR)</b> при линейном пересчёте текущей ставки за интервал.\n\n"
-        
+
         for i, item in enumerate(page_data, start=start_idx + 1):
             symbol = item.get("symbol", "N/A")
             exchange = item.get("exchangeName", "N/A")
             raw_rate = item.get("rate", 0)
             interval = item.get("interval", 8)
             margin_type = item.get("marginType", "USDT")
+
             annual_rate = self.annualize_rate(raw_rate, interval)
             annual_str = self.format_annual_rate(annual_rate)
             ex_emoji = self.get_exchange_emoji(exchange)
             emoji = "🔴" if funding_type == "negative" else "🟢"
-            
+
             response += f"{emoji} <b>{symbol}</b>\n"
             response += f" {ex_emoji} {exchange} ({margin_type})\n"
             response += f" 💰 {annual_str} годовых | ⏰ интервал: {interval}ч | ставка за интервал: {raw_rate:.6f}%\n\n"
-        
+
         keyboard = []
-        
         if total_pages > 1:
             nav_buttons = []
             if page > 1:
@@ -838,20 +635,19 @@ class CryptoArbBot:
             if page < total_pages:
                 nav_buttons.append(InlineKeyboardButton("Вперед ▶", callback_data=f"page_{funding_type}_{page+1}"))
             keyboard.append(nav_buttons)
-        
+
         quick_nav = []
         if total_pages > 5:
             quick_pages = set([1, max(1, page-2), page, min(total_pages, page+2), total_pages])
             for quick_page in sorted(quick_pages):
                 if quick_page != page:
                     quick_nav.append(InlineKeyboardButton(str(quick_page), callback_data=f"page_{funding_type}_{quick_page}"))
-        
-        if quick_nav:
-            keyboard.append(quick_nav)
-        
+            if quick_nav:
+                keyboard.append(quick_nav)
+
         keyboard.append([InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
+
         try:
             await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
         except Exception as e:
@@ -864,16 +660,15 @@ class CryptoArbBot:
             send_method = update.callback_query.edit_message_text
         else:
             send_method = update.message.reply_text
-        
+
         if not self.funding_cache:
             await send_method("⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.")
             return
-        
+
         positive_data = self.get_filtered_funding("positive")[:10]
         negative_data = self.get_filtered_funding("negative")[:10]
-        
+
         response = "<b>🚀 Топ 10 лучших фандингов (APR)</b>\n\n"
-        
         response += "<b>🟢 Топ 10 положительных (годовых, по убыванию):</b>\n"
         for i, item in enumerate(positive_data, 1):
             symbol = item.get("symbol", "")
@@ -883,12 +678,11 @@ class CryptoArbBot:
             annual_rate = self.annualize_rate(raw_rate, interval)
             annual_str = self.format_annual_rate(annual_rate)
             ex_emoji = self.get_exchange_emoji(exchange)
-            
             response += (
                 f"{i}. <b>{symbol}</b> - {annual_str} годовых "
                 f"({ex_emoji} {exchange}, интервал: {interval}ч, ставка за интервал: {raw_rate:.6f}%)\n"
             )
-        
+
         response += "\n<b>🔴 Топ 10 отрицательных (годовых, по мере роста):</b>\n"
         for i, item in enumerate(negative_data, 1):
             symbol = item.get("symbol", "")
@@ -898,16 +692,15 @@ class CryptoArbBot:
             annual_rate = self.annualize_rate(raw_rate, interval)
             annual_str = self.format_annual_rate(annual_rate)
             ex_emoji = self.get_exchange_emoji(exchange)
-            
             response += (
                 f"{i}. <b>{symbol}</b> - {annual_str} годовых "
                 f"({ex_emoji} {exchange}, интервал: {interval}ч, ставка за интервал: {raw_rate:.6f}%)\n"
             )
-        
+
         if self.funding_cache_updated_at:
             cache_time = self.funding_cache_updated_at.strftime("%H:%M:%S")
             response += f"\n🕒 <i>Данные обновлены: {cache_time} UTC</i>"
-        
+
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
@@ -917,48 +710,49 @@ class CryptoArbBot:
             send_method = update.callback_query.edit_message_text
         else:
             send_method = update.message.reply_text
-        
+
         if not self.funding_cache:
             await send_method("⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.")
             return
-        
+
         symbol_data = {}
         for item in self.funding_cache:
             symbol = item.get("symbol", "")
             if not symbol:
                 continue
-            
+
             rate = item.get("rate", 0)
+
             if symbol not in symbol_data:
                 symbol_data[symbol] = []
-            
+
             symbol_data[symbol].append({
                 'exchange': item.get("exchangeName", ""),
                 'rate': rate,
                 'interval': item.get("interval", 8),
                 'marginType': item.get("marginType", "")
             })
-        
+
         opportunities = []
         for symbol, exchanges in symbol_data.items():
             if len(exchanges) < 2:
                 continue
-            
+
             valid_exchanges = exchanges
             if len(valid_exchanges) < 2:
                 continue
-            
+
             min_item = min(valid_exchanges, key=lambda x: x['rate'])
             max_item = max(valid_exchanges, key=lambda x: x['rate'])
             spread = max_item['rate'] - min_item['rate']
-            
+
             if abs(spread) < 0.0005:
                 continue
-            
+
             time_warning = ""
             if min_item['interval'] != max_item['interval']:
                 time_warning = " ⚠️ РАЗНОЕ ВРЕМЯ ВЫПЛАТ!"
-            
+
             opportunities.append({
                 'symbol': symbol,
                 'min_exchange': min_item['exchange'],
@@ -970,11 +764,10 @@ class CryptoArbBot:
                 'spread': spread,
                 'time_warning': time_warning
             })
-        
+
         opportunities.sort(key=lambda x: abs(x['spread']), reverse=True)
-        
+
         response = "<b>⚖️ Связки арбитража фандинга (APR)</b>\n\n"
-        
         if not opportunities:
             response += (
                 "🤷‍♂️ <b>Арбитражные возможности не найдены</b>\n\n"
@@ -986,19 +779,18 @@ class CryptoArbBot:
         else:
             response += f"📊 Найдено возможностей: {len(opportunities)}\n"
             response += "💡 Ставки показаны в <b>годовых процентах (APR)</b> с учётом интервала каждой биржи.\n\n"
-            
             for opp in opportunities[:15]:
                 min_annual = self.annualize_rate(opp['min_rate'], opp['min_interval'])
                 max_annual = self.annualize_rate(opp['max_rate'], opp['max_interval'])
                 spread_annual = max_annual - min_annual
-                
+
                 min_emoji = self.get_exchange_emoji(opp['min_exchange'])
                 max_emoji = self.get_exchange_emoji(opp['max_exchange'])
-                
+
                 min_annual_str = self.format_annual_rate(min_annual)
                 max_annual_str = self.format_annual_rate(max_annual)
                 spread_annual_str = self.format_annual_rate(spread_annual)
-                
+
                 response += f"🎯 <b>{opp['symbol']}</b>{opp['time_warning']}\n"
                 response += (
                     f" 📉 {min_emoji} {opp['min_exchange']}: {min_annual_str} годовых "
@@ -1009,7 +801,7 @@ class CryptoArbBot:
                     f"(интервал: {opp['max_interval']}ч, ставка за интервал: {opp['max_rate']:.6f}%)\n"
                 )
                 response += f" 💰 Спред (APR): {spread_annual_str}\n\n"
-        
+
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
@@ -1019,51 +811,38 @@ class CryptoArbBot:
             send_method = update.callback_query.edit_message_text
         else:
             send_method = update.message.reply_text
-        
+
         if not self.funding_cache:
             await send_method("⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.")
             return
-        
+
         exchanges = self.get_all_exchanges()
         if not exchanges:
             await send_method("🤷‍♂️ Не удалось получить список бирж.")
             return
-        
+
         response = "<b>🏛️ Все доступные биржи</b>\n\n"
         response += f"📊 Всего бирж: {len(exchanges)}\n\n"
-        
+
         per_line = 3
         for i in range(0, len(exchanges), per_line):
             line = exchanges[i:i + per_line]
             decorated = [f"{self.get_exchange_emoji(ex)} {ex}" for ex in line]
             response += " • " + " • ".join(decorated) + "\n"
-        
+
         unique_symbols = len(set(item.get('symbol', '') for item in self.funding_cache))
         total_records = len(self.funding_cache)
-        
+
         response += f"\n📈 <b>Статистика данных:</b>\n"
         response += f"• Всего записей: {total_records}\n"
         response += f"• Уникальных пар: {unique_symbols}\n"
         response += f"• Бирж: {len(exchanges)}\n"
-        
-        # Добавляем информацию о Hyperliquid и dYdX
-        response += "\n⚡ <b>Дополнительные биржи:</b>\n"
-        response += "• Hyperliquid: /hyperliquid\n"
-        response += "• dYdX: /dydx\n"
-        response += "• Все данные: /all_exchanges\n"
-        
+
         if self.funding_cache_updated_at:
             cache_time = self.funding_cache_updated_at.strftime("%H:%M:%S")
             response += f"\n🕒 <i>Данные обновлены: {cache_time} UTC</i>"
-        
-        keyboard = [
-            [
-                InlineKeyboardButton("⚡ Hyperliquid", callback_data="exchange_hyperliquid"),
-                InlineKeyboardButton("🌀 dYdX", callback_data="exchange_dydx")
-            ],
-            [InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]
-        ]
-        
+
+        keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
     async def show_price_arbitrage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1072,22 +851,21 @@ class CryptoArbBot:
             send_method = update.callback_query.edit_message_text
         else:
             send_method = update.message.reply_text
-        
+
         await send_method("🔍 Ищу арбитражные возможности по цене...")
-        
+
         opportunities = self.api.get_arbitrage_opportunities()
         if not opportunities:
             await send_method("🤷‍♂️ Арбитражные возможности по цене не найдены")
             return
-        
+
         response = "💸 <b>Арбитражные возможности по цене (BTC):</b>\n\n"
-        
         for opp in opportunities[:10]:
             response += f"🎯 <b>{opp['symbol']}</b>\n"
             response += f" 📊 Спред: {opp['spread_percent']}%\n"
             response += f" 💰 Мин: ${opp['min_price']:.2f}\n"
             response += f" 💰 Макс: ${opp['max_price']:.2f}\n\n"
-        
+
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
@@ -1097,10 +875,10 @@ class CryptoArbBot:
             send_method = update.callback_query.edit_message_text
         else:
             send_method = update.message.reply_text
-        
+
         cache_size = len(self.funding_cache) if self.funding_cache else 0
         last_update = self.funding_cache_updated_at.strftime("%Y-%m-%d %H:%M:%S UTC") if self.funding_cache_updated_at else "Никогда"
-        
+
         if self.funding_cache:
             positive_count = len([x for x in self.funding_cache if x.get('rate', 0) > 0])
             negative_count = len([x for x in self.funding_cache if x.get('rate', 0) < 0])
@@ -1109,31 +887,21 @@ class CryptoArbBot:
             unique_exchanges = len(set(item.get('exchangeName', '') for item in self.funding_cache))
         else:
             positive_count = negative_count = zero_count = unique_symbols = unique_exchanges = 0
-        
-        # Статус Hyperliquid
-        hyperliquid_status = "✅ Загружено" if self.hyperliquid_cache else "❌ Нет данных"
-        dydx_status = "✅ Загружено" if self.dydx_cache else "❌ Нет данных"
-        
+
         response = (
             "📊 <b>Статус бота</b>\n\n"
-            f"• 🗄️ Размер кэша Coinglass: {cache_size} записей\n"
-            f"• 🕒 Последнее обновление Coinglass: {last_update}\n"
+            f"• 🗄️ Размер кэша: {cache_size} записей\n"
+            f"• 🕒 Последнее обновление: {last_update}\n"
             f"• 📈 Уникальные символы: {unique_symbols}\n"
-            f"• 🏛️ Уникальные биржи Coinglass: {unique_exchanges}\n\n"
-            
-            "<b>Дополнительные биржи:</b>\n"
-            f"• ⚡ Hyperliquid: {hyperliquid_status}\n"
-            f"• 🌀 dYdX: {dydx_status}\n\n"
-            
+            f"• 🏛️ Уникальные биржи: {unique_exchanges}\n\n"
             f"<b>Статистика фандингов (по ставке за интервал):</b>\n"
             f"• 🟢 Положительные: {positive_count}\n"
             f"• 🔴 Отрицательные: {negative_count}\n"
             f"• ⚪ Нулевые: {zero_count}\n\n"
-            
             f"<i>Кэш обновляется каждые 30 секунд. Доходность в интерфейсе показана в годовых процентах (APR), "
             f"исходя из последней ставки за интервал.</i>"
         )
-        
+
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
@@ -1141,21 +909,18 @@ class CryptoArbBot:
         """Обработчик инлайн-кнопок"""
         query = update.callback_query
         await query.answer()
-        
+
         try:
             data = query.data
-            
             if data.startswith("page_"):
                 parts = data.split("_")
                 if len(parts) == 3:
                     funding_type = parts[1]
                     page = int(parts[2])
                     await self.show_funding_page(update, context, funding_type, page)
-            
             elif data.startswith("nav_"):
                 parts = data.split("_")
                 nav_type = parts[1]
-                
                 if nav_type == "main":
                     await self.show_main_menu(update, context)
                 elif nav_type == "negative":
@@ -1172,24 +937,6 @@ class CryptoArbBot:
                     await self.show_price_arbitrage(update, context)
                 elif nav_type == "status":
                     await self.show_status(update, context)
-            
-            elif data.startswith("exchange_"):
-                parts = data.split("_")
-                exchange_type = parts[1]
-                
-                if exchange_type == "hyperliquid":
-                    if len(parts) > 2 and parts[2] == "refresh":
-                        # Очищаем кэш и обновляем
-                        self.hyperliquid_cache = None
-                    await self.show_hyperliquid(update, context)
-                elif exchange_type == "dydx":
-                    if len(parts) > 2 and parts[2] == "refresh":
-                        # Очищаем кэш и обновляем
-                        self.dydx_cache = None
-                    await self.show_dydx(update, context)
-                elif exchange_type == "all":
-                    await self.show_all_exchanges_data(update, context)
-        
         except Exception as e:
             logger.error("Ошибка в обработчике кнопок: %s", e)
             try:
@@ -1209,18 +956,16 @@ class CryptoArbBot:
         if text.isdigit():
             page_num = int(text)
             user_data = context.user_data
-            
             if 'current_data_type' in user_data and 'total_pages' in user_data:
                 total_pages = user_data['total_pages']
                 funding_type = user_data['current_data_type']
-                
                 if 1 <= page_num <= total_pages:
                     await self.show_funding_page(update, context, funding_type, page_num)
                     return
                 else:
                     await update.message.reply_text(f"⚠️ Страница должна быть от 1 до {total_pages}")
                     return
-        
+
         await update.message.reply_text(
             "ℹ️ <b>Быстрая навигация</b>\n\n"
             "Введите номер страницы для быстрого перехода\n"
@@ -1229,10 +974,7 @@ class CryptoArbBot:
             "/positive - положительные фандинги\n"
             "/top10 - топ 10 фандингов\n"
             "/arbitrage_bundles - арбитражные связки\n"
-            "/exchanges - все доступные биржи\n"
-            "/hyperliquid - данные с Hyperliquid\n"
-            "/dydx - данные с dYdX\n"
-            "/all_exchanges - все данные бирж",
+            "/exchanges - все доступные биржи",
             parse_mode="HTML"
         )
 
@@ -1246,9 +988,6 @@ class CryptoArbBot:
             [InlineKeyboardButton("🏛️ Все биржи", callback_data="nav_exchanges")],
             [InlineKeyboardButton("💰 Ценовой арбитраж", callback_data="nav_price_arb")],
             [InlineKeyboardButton("📊 Статус бота", callback_data="nav_status")],
-            [InlineKeyboardButton("⚡ Hyperliquid", callback_data="exchange_hyperliquid")],
-            [InlineKeyboardButton("🌀 dYdX", callback_data="exchange_dydx")],
-            [InlineKeyboardButton("📈 Все данные бирж", callback_data="exchange_all")],
         ]
         
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1264,22 +1003,13 @@ class CryptoArbBot:
         print("🤖 Бот запущен...")
         print("⚡ Кеширование каждые 30 секунд")
         print("📊 Мониторинг фандингов и арбитража")
-        print("🔗 Подключены биржи: Coinglass, Hyperliquid, dYdX")
-        
-        # Запускаем обновление кэша фандингов
+
         self.application.job_queue.run_repeating(
             self.update_funding_cache,
             interval=30,
             first=0,
         )
-        
-        # Запускаем обновление данных с Hyperliquid и dYdX
-        self.application.job_queue.run_repeating(
-            self.update_exchanges_cache,
-            interval=30,
-            first=5,
-        )
-        
+
         try:
             self.application.run_polling(
                 drop_pending_updates=True,
