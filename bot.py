@@ -2,6 +2,7 @@ import logging
 import asyncio
 from datetime import datetime, timezone
 import requests
+from typing import Any, Dict, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -23,9 +24,313 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class LighterFundingAPI:
+    """
+    Парсер фандингов для биржи Lighter на основе публичных API.
+
+    Использует:
+    - Текущие ставки фандинга: https://mainnet.zklighter.elliot.ai/api/v1/funding-rates
+    - Список рынков:           https://explorer.elliot.ai/api/markets
+
+    Все эндпоинты публичные, без API-ключей.
+    """
+
+    BASE_URL = "https://mainnet.zklighter.elliot.ai/api/v1"
+    EXPLORER_URL = "https://explorer.elliot.ai/api"
+
+    def __init__(self, timeout: int = 10):
+        self.timeout = timeout
+        self._markets_cache: Optional[Dict[str, Dict[str, Any]]] = None
+
+    # ============ НИЗКОУРОВНЕВЫЕ ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ============
+
+    def _request(self, method: str, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        """
+        Универсальный HTTP-запрос с логированием и обработкой ошибок.
+        """
+        try:
+            resp = requests.request(method, url, params=params, timeout=self.timeout)
+        except Exception as e:
+            logger.error("Lighter API request error %s %s: %s", method, url, e)
+            raise
+
+        if not resp.ok:
+            logger.error("Lighter API HTTP %s for %s %s: %s", resp.status_code, method, url, resp.text[:500])
+            resp.raise_for_status()
+
+        try:
+            data = resp.json()
+        except Exception as e:
+            logger.error("Lighter API JSON parse error for %s %s: %s", method, url, e)
+            raise
+
+        return data
+
+    # ============ МАРКЕТЫ ============
+
+    def get_markets_raw(self) -> Any:
+        """
+        Возвращает сырой ответ списка рынков с /api/markets (Explorer API).
+
+        Эндпоинт: GET https://explorer.elliot.ai/api/markets
+        """
+        url = f"{self.EXPLORER_URL}/markets"
+        return self._request("GET", url)
+
+    def get_markets_map(self, force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+        """
+        Кэширует и возвращает словарь рынков по market_id.
+
+        Возвращает:
+            {
+                "BTC-PERP": {
+                    "id": "BTC-PERP",
+                    "symbol": "BTC-PERP",
+                    "raw": {...}
+                },
+                ...
+            }
+        """
+        if self._markets_cache is not None and not force_refresh:
+            return self._markets_cache
+
+        data = self.get_markets_raw()
+
+        markets_map: Dict[str, Dict[str, Any]] = {}
+
+        # Возможные варианты структуры:
+        # 1) просто список объектов
+        # 2) { "markets": [...] }
+        if isinstance(data, dict) and "markets" in data:
+            markets_list = data.get("markets") or []
+        elif isinstance(data, list):
+            markets_list = data
+        else:
+            logger.warning("Unexpected markets response format from Lighter: %s", type(data))
+            markets_list = []
+
+        for item in markets_list:
+            if not isinstance(item, dict):
+                continue
+
+            market_id = (
+                item.get("id")
+                or item.get("marketId")
+                or item.get("market_id")
+            )
+            if not market_id:
+                # если нет явного id — пропускаем
+                continue
+
+            symbol = (
+                item.get("symbol")
+                or item.get("ticker")
+                or item.get("name")
+                or str(market_id)
+            )
+
+            markets_map[str(market_id)] = {
+                "id": str(market_id),
+                "symbol": str(symbol),
+                "raw": item,
+            }
+
+        self._markets_cache = markets_map
+        return markets_map
+
+    # ============ ФАНДИНГИ ============
+
+    def get_funding_rates_raw(self, params: Optional[Dict[str, Any]] = None) -> Any:
+        """
+        Сырой вызов текущих ставок фандинга.
+
+        Эндпоинт: GET https://mainnet.zklighter.elliot.ai/api/v1/funding-rates
+
+        params — оставляю на будущее (если понадобится фильтрация по marketId и т.п.).
+        Сейчас можно вызывать без параметров для получения всех рынков.
+        """
+        url = f"{self.BASE_URL}/funding-rates"
+        return self._request("GET", url, params=params)
+
+    def _normalize_funding_entry(
+        self,
+        entry: Dict[str, Any],
+        markets_map: Dict[str, Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Нормализует одну запись фандинга в единый формат.
+
+        Попытка угадать стандартные поля:
+        - market_id
+        - symbol
+        - funding_rate_hourly
+        - funding_rate_8h / per_period
+        - next_funding_time
+        и т.д.
+
+        Если ставка фандинга равна 0 — возвращает None (чтобы убрать нулевые фандинги).
+        """
+        # Пытаемся извлечь идентификатор рынка
+        market_id = (
+            entry.get("marketId")
+            or entry.get("market_id")
+            or entry.get("id")
+        )
+        market_id = str(market_id) if market_id is not None else None
+
+        # Берём символ из карты рынков, либо из самой записи
+        symbol = None
+        if market_id and market_id in markets_map:
+            symbol = markets_map[market_id]["symbol"]
+        symbol = (
+            symbol
+            or entry.get("symbol")
+            or entry.get("ticker")
+            or entry.get("name")
+            or market_id
+        )
+
+        # Нормализуем саму ставку (часовую или периодическую)
+        funding_rate_hourly = (
+            entry.get("hourlyFundingRate")
+            or entry.get("fundingRateHourly")
+            or entry.get("fundingRate")
+            or entry.get("funding_rate")
+        )
+
+        # Могут быть дополнительные поля (например, прогноз, ставка за период)
+        funding_rate_predicted = (
+            entry.get("predictedFundingRate")
+            or entry.get("predictedFunding")
+            or entry.get("nextFundingRate")
+        )
+
+        funding_rate_8h = (
+            entry.get("fundingRate8h")
+            or entry.get("fundingRatePerPeriod")
+            or entry.get("fundingRatePer8h")
+        )
+
+        next_funding_time = (
+            entry.get("nextFundingTime")
+            or entry.get("nextFundingTimestamp")
+        )
+
+        # Отбрасываем записи, где вообще нет ставки
+        if funding_rate_hourly is None and funding_rate_predicted is None and funding_rate_8h is None:
+            return None
+
+        # Определяем основную "базовую" ставку,
+        # по которой будем фильтровать нули
+        base_rate = funding_rate_hourly
+        if base_rate is None:
+            base_rate = funding_rate_8h
+        if base_rate is None:
+            base_rate = funding_rate_predicted
+
+        try:
+            base_rate_float = float(base_rate)
+        except Exception:
+            # если не можем привести к float — всё равно отдаём, но без фильтра нулей
+            base_rate_float = None
+
+        # ФИЛЬТР НУЛЕВЫХ ФАНДИНГОВ:
+        # Если есть числовое значение и оно == 0.0 — пропускаем запись
+        if base_rate_float is not None and base_rate_float == 0.0:
+            return None
+
+        return {
+            "market_id": market_id,
+            "symbol": symbol,
+            "funding_rate_hourly": funding_rate_hourly,
+            "funding_rate_8h": funding_rate_8h,
+            "funding_rate_predicted": funding_rate_predicted,
+            "next_funding_time": next_funding_time,
+            "raw": entry,
+        }
+
+    def get_all_funding_nonzero(self) -> List[Dict[str, Any]]:
+        """
+        Возвращает список нормализованных записей фандинга для ВСЕХ рынков Lighter
+        БЕЗ НУЛЕВЫХ ставок фандинга.
+        """
+        raw = self.get_funding_rates_raw()
+        markets_map = self.get_markets_map()
+
+        # Возможные форматы:
+        # 1) список
+        # 2) { "data": [...] }
+        # 3) что-то ещё — пытаемся вытащить лучшее
+        if isinstance(raw, dict) and "data" in raw:
+            entries = raw.get("data") or []
+        elif isinstance(raw, list):
+            entries = raw
+        else:
+            logger.warning("Unexpected funding-rates response format from Lighter: %s", type(raw))
+            entries = []
+
+        result: List[Dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            norm = self._normalize_funding_entry(entry, markets_map)
+            if norm is not None:
+                result.append(norm)
+
+        # Можно отсортировать по абсолютной ставке, если нужно
+        def _key(e: Dict[str, Any]) -> float:
+            v = e.get("funding_rate_hourly") or e.get("funding_rate_8h") or e.get("funding_rate_predicted") or 0
+            try:
+                return abs(float(v))
+            except Exception:
+                return 0.0
+
+        result.sort(key=_key, reverse=True)
+        return result
+
+    def get_funding_for_symbol(self, symbol: str) -> List[Dict[str, Any]]:
+        """
+        Фандинги (ненулевые) только для конкретного символа (без учёта регистра).
+
+        Например: symbol="BTC-PERP" или "ETH-PERP".
+        """
+        symbol_lower = symbol.lower()
+        all_items = self.get_all_funding_nonzero()
+        return [
+            item for item in all_items
+            if item.get("symbol", "").lower() == symbol_lower
+               or item.get("market_id", "").lower() == symbol_lower
+        ]
+
+    def get_top_funding(
+        self,
+        limit: int = 20,
+        min_abs_rate: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Топ рынков по |ставке фандинга| (уже без нулей).
+
+        min_abs_rate — если задано, отфильтровывает по абсолютному значению
+        (например, 0.0001 = 0.01%).
+        """
+        all_items = self.get_all_funding_nonzero()
+        if min_abs_rate is not None:
+            filtered: List[Dict[str, Any]] = []
+            for item in all_items:
+                v = item.get("funding_rate_hourly") or item.get("funding_rate_8h") or item.get("funding_rate_predicted")
+                try:
+                    if abs(float(v)) >= float(min_abs_rate):
+                        filtered.append(item)
+                except Exception:
+                    continue
+            all_items = filtered
+
+        return all_items[:limit]
+
+
 class CoinglassAPI:
     """
-    Обёртка над Coinglass API + Hyperliquid + Paradex
+    Обёртка над Coinglass API + Hyperliquid + Paradex + EdgeX + Lighter
     """
     def __init__(self):
         self.base_url_v3 = "https://open-api.coinglass.com/api/pro/v1"
@@ -42,6 +347,12 @@ class CoinglassAPI:
         # Публичный REST API Paradex (без ключей)
         self.paradex_base_url = "https://api.prod.paradex.trade/v1"
         self.paradex_headers = {
+            "accept": "application/json",
+        }
+
+        # Публичный REST API EdgeX (без ключей)
+        self.edgex_base_url = "https://pro.edgex.exchange"
+        self.edgex_headers = {
             "accept": "application/json",
         }
 
@@ -63,7 +374,7 @@ class CoinglassAPI:
 
     def get_funding_rates(self):
         """
-        Полный запрос всех ставок фандинга с Coinglass + доп. добавление Hyperliquid + Paradex
+        Полный запрос всех ставок фандинга с Coinglass + доп. добавление Hyperliquid + Paradex + EdgeX + Lighter
         """
         url = f"{self.base_url_v4}/futures/funding-rate/exchange-list"
         MAX_RETRIES = 3
@@ -190,6 +501,56 @@ class CoinglassAPI:
                         logger.info("Paradex: нативный API вернул 0 записей")
                 except Exception as pdx_ex:
                     logger.warning("Ошибка при добавлении Paradex: %s", pdx_ex)
+
+                # Добавляем EdgeX из нативного API
+                try:
+                    edgex_items = self._get_edgex_funding()
+                    if edgex_items:
+                        existing_keys = {
+                            (str(row.get("symbol")), str(row.get("exchangeName")).lower())
+                            for row in result
+                        }
+                        added = 0
+                        for it in edgex_items:
+                            key = (str(it.get("symbol")), str(it.get("exchangeName")).lower())
+                            if key in existing_keys:
+                                continue
+                            result.append(it)
+                            existing_keys.add(key)
+                            added += 1
+                        logger.info(
+                            "EdgeX: добавлено %d новых записей в общий кэш фандинга",
+                            added,
+                        )
+                    else:
+                        logger.info("EdgeX: нативный API вернул 0 записей")
+                except Exception as edx_ex:
+                    logger.warning("Ошибка при добавлении EdgeX: %s", edx_ex)
+
+                # Добавляем Lighter из нативного API
+                try:
+                    lighter_items = self._get_lighter_funding()
+                    if lighter_items:
+                        existing_keys = {
+                            (str(row.get("symbol")), str(row.get("exchangeName")).lower())
+                            for row in result
+                        }
+                        added = 0
+                        for it in lighter_items:
+                            key = (str(it.get("symbol")), str(it.get("exchangeName")).lower())
+                            if key in existing_keys:
+                                continue
+                            result.append(it)
+                            existing_keys.add(key)
+                            added += 1
+                        logger.info(
+                            "Lighter: добавлено %d новых записей в общий кэш фандинга",
+                            added,
+                        )
+                    else:
+                        logger.info("Lighter: нативный API вернул 0 записей")
+                except Exception as l_ex:
+                    logger.warning("Ошибка при добавлении Lighter: %s", l_ex)
 
                 return result
 
@@ -473,6 +834,200 @@ class CoinglassAPI:
 
         return items
 
+    def _get_edgex_funding(self) -> List[Dict[str, Any]]:
+        """
+        Загрузка ставок фандинга с EdgeX через публичный REST API.
+
+        Используем:
+        - GET /api/v1/public/meta/getMetaData
+        - GET /api/v1/public/funding/getLatestFundingRate
+
+        Возвращаем список объектов в формате бота.
+        """
+        items: List[Dict[str, Any]] = []
+
+        contracts_meta: Dict[str, Dict[str, Any]] = {}
+        coin_by_id: Dict[str, Dict[str, Any]] = {}
+
+        # 1) meta
+        try:
+            url_meta = f"{self.edgex_base_url}/api/v1/public/meta/getMetaData"
+            resp = requests.get(url_meta, headers=self.edgex_headers, timeout=10)
+            resp.raise_for_status()
+            meta_json = resp.json()
+
+            if meta_json.get("code") != "SUCCESS":
+                logger.warning("EdgeX meta/getMetaData error: %s", meta_json)
+                return items
+
+            data = meta_json.get("data") or {}
+
+            for coin in data.get("coinList", []) or []:
+                cid = coin.get("coinId")
+                if cid:
+                    coin_by_id[cid] = coin
+
+            for c in data.get("contractList", []) or []:
+                cid = c.get("contractId")
+                if not cid:
+                    continue
+                if not c.get("enableDisplay", True):
+                    continue
+                if not c.get("enableTrade", True):
+                    continue
+                if not c.get("enableOpenPosition", True):
+                    continue
+                contracts_meta[cid] = c
+
+            logger.info("EdgeX meta/getMetaData: загружено %d активных контрактов", len(contracts_meta))
+        except Exception as e:
+            logger.warning("EdgeX: ошибка при запросе meta/getMetaData: %s", e)
+            return items
+
+        if not contracts_meta:
+            return items
+
+        def _safe_float(x: Any) -> Optional[float]:
+            try:
+                return float(x)
+            except (TypeError, ValueError):
+                return None
+
+        funding_by_id: Dict[str, Dict[str, Any]] = {}
+
+        # 2) bulk getLatestFundingRate
+        try:
+            url_funding = f"{self.edgex_base_url}/api/v1/public/funding/getLatestFundingRate"
+            resp = requests.get(url_funding, headers=self.edgex_headers, timeout=10)
+            resp.raise_for_status()
+            f_json = resp.json()
+            if f_json.get("code") == "SUCCESS":
+                data_list = f_json.get("data") or []
+                if isinstance(data_list, list):
+                    for fr in data_list:
+                        cid = fr.get("contractId")
+                        if not cid:
+                            continue
+                        funding_by_id[cid] = fr
+                logger.info("EdgeX getLatestFundingRate (bulk): получено %d записей", len(funding_by_id))
+            else:
+                logger.warning("EdgeX getLatestFundingRate (bulk) code != SUCCESS: %s", f_json)
+        except Exception as e:
+            logger.warning("EdgeX: ошибка bulk getLatestFundingRate, fallback per-contract: %s", e)
+
+        # 3) per-contract fallback
+        if not funding_by_id or len(funding_by_id) < len(contracts_meta):
+            for cid in contracts_meta.keys():
+                if cid in funding_by_id:
+                    continue
+                try:
+                    url_funding = f"{self.edgex_base_url}/api/v1/public/funding/getLatestFundingRate"
+                    resp = requests.get(
+                        url_funding,
+                        headers=self.edgex_headers,
+                        params={"contractId": cid},
+                        timeout=10,
+                    )
+                    resp.raise_for_status()
+                    f_json = resp.json()
+                    if f_json.get("code") != "SUCCESS":
+                        continue
+                    data_list = f_json.get("data") or []
+                    if not isinstance(data_list, list) or not data_list:
+                        continue
+                    funding_by_id[cid] = data_list[-1]
+                except Exception as e:
+                    logger.warning("EdgeX: ошибка getLatestFundingRate для контракта %s: %s", cid, e)
+
+        # 4) нормализация
+        for cid, meta in contracts_meta.items():
+            fr = funding_by_id.get(cid)
+            if not fr:
+                continue
+
+            rate_dec = _safe_float(fr.get("fundingRate"))
+            if rate_dec is None:
+                continue
+            rate_percent = rate_dec * 100.0
+
+            interval_min = _safe_float(fr.get("fundingRateIntervalMin") or meta.get("fundingRateIntervalMin"))
+            if interval_min is None or interval_min <= 0:
+                interval_min = 240.0
+            interval_hours = interval_min / 60.0
+
+            quote_coin_id = meta.get("quoteCoinId")
+            quote_coin = coin_by_id.get(quote_coin_id, {})
+            quote_name = quote_coin.get("coinName") or "USDT"
+
+            symbol = meta.get("contractName") or cid
+
+            items.append({
+                "symbol": symbol,
+                "exchangeName": "EdgeX",
+                "rate": rate_percent,
+                "marginType": quote_name,
+                "interval": interval_hours,
+                "nextFundingTime": fr.get("fundingTime", ""),
+                "stableCoin": quote_name,
+                "source": "edgex_funding",
+            })
+
+        logger.info("EdgeX: нормализовано %d записей funding", len(items))
+        return items
+
+    def _get_lighter_funding(self) -> List[Dict[str, Any]]:
+        """
+        Загрузка ставок фандинга с Lighter через публичный API.
+        Использует LighterFundingAPI и приводит данные к формату бота.
+        """
+        items: List[Dict[str, Any]] = []
+        try:
+            api = LighterFundingAPI(timeout=10)
+            raw_items = api.get_all_funding_nonzero()
+        except Exception as e:
+            logger.warning("Lighter: ошибка при запросе фандинга: %s", e)
+            return items
+
+        for entry in raw_items:
+            base = (
+                entry.get("funding_rate_8h")
+                or entry.get("funding_rate_hourly")
+                or entry.get("funding_rate_predicted")
+            )
+            try:
+                base_dec = float(base)
+            except Exception:
+                continue
+
+            # если есть ставка за 8ч — берём её как интервал 8 часов,
+            # иначе считаем, что ставка почасовая
+            if entry.get("funding_rate_8h") is not None:
+                interval_hours = 8.0
+            else:
+                interval_hours = 1.0
+
+            rate_percent = base_dec * 100.0
+
+            symbol = (
+                entry.get("symbol")
+                or entry.get("market_id")
+                or "UNKNOWN"
+            )
+
+            items.append({
+                "symbol": symbol,
+                "exchangeName": "Lighter",
+                "rate": rate_percent,
+                "marginType": "USDC",
+                "interval": interval_hours,
+                "nextFundingTime": entry.get("next_funding_time") or "",
+                "stableCoin": "USDC",
+                "source": "lighter_funding",
+            })
+
+        logger.info("Lighter: нормализовано %d записей funding", len(items))
+        return items
+
     def get_arbitrage_opportunities(self):
         """
         Арбитраж по цене через v3 API (доп. функция)
@@ -635,6 +1190,10 @@ class CryptoArbBot:
                 return "🌊"
             if "paradex" in name:
                 return "🌀"
+            if "edgex" in name:
+                return "🧊"
+            if "lighter" in name:
+                return "🔥"
         return "🏦"
 
     async def update_funding_cache(self, context: ContextTypes.DEFAULT_TYPE):
@@ -701,6 +1260,8 @@ class CryptoArbBot:
             CommandHandler("status", self.show_status),
             CommandHandler("exchanges", self.show_exchanges),
             CommandHandler("hyperliquid", self.show_hyperliquid),
+            CommandHandler("edgex", self.show_edgex),
+            CommandHandler("lighter", self.show_lighter),
             CallbackQueryHandler(self.button_handler, pattern="^(page_|nav_)"),
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message),
         ]
@@ -741,13 +1302,15 @@ class CryptoArbBot:
             "/exchanges - все доступные биржи\n"
             "/price_arbitrage - ценовой арбитраж\n"
             "/hyperliquid - только пары с биржи Hyperliquid\n"
+            "/edgex - только пары с биржи EdgeX\n"
+            "/lighter - только пары с биржи Lighter\n"
             "/status - статус бота и кэша\n\n"
             "⚡ Особенности:\n"
             "• Пагинация по 20 записей\n"
             "• Сортировка: отрицательные по мере роста, положительные по мере убывания\n"
             "• Проверка времени выплат в арбитраже\n"
             "• Кэширование каждые 30 секунд\n"
-            "• Поддержка Hyperliquid и Paradex через нативный API\n\n"
+            "• Поддержка Hyperliquid, Paradex, EdgeX и Lighter через нативный API\n\n"
             "Все ставки показываются в <b>процентах годовых (APR)</b>, рассчитанных из текущей ставки за интервал."
         )
         await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode="HTML")
@@ -1298,8 +1861,16 @@ class CryptoArbBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
 
+    async def show_edgex(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
+        """Обёртка для отображения только биржи EdgeX через команду /edgex"""
+        await self.show_exchange_funding(update, context, "EdgeX", page)
+
+    async def show_lighter(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
+        """Обёртка для отображения только биржи Lighter через команду /lighter"""
+        await self.show_exchange_funding(update, context, "Lighter", page)
+
     async def show_exchange_funding(self, update: Update, context: ContextTypes.DEFAULT_TYPE, exchange_name: str, page: int = 1):
-        """Вывод фандингов по одной бирже с пагинацией (включая Paradex и Hyperliquid)"""
+        """Вывод фандингов по одной бирже с пагинацией (включая Paradex, Hyperliquid, EdgeX, Lighter и др.)"""
         if update.callback_query:
             send_method = update.callback_query.edit_message_text
         else:
@@ -1511,7 +2082,9 @@ class CryptoArbBot:
             "/top10 - топ 10 фандингов\n"
             "/arbitrage_bundles - арбитражные связки\n"
             "/exchanges - все доступные биржи\n"
-            "/hyperliquid - пары Hyperliquid",
+            "/hyperliquid - пары Hyperliquid\n"
+            "/edgex - пары EdgeX\n"
+            "/lighter - пары Lighter",
             parse_mode="HTML",
         )
 
