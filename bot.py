@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import requests
 from typing import Any, Dict, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -55,7 +56,13 @@ class LighterFundingAPI:
             raise
 
         if not resp.ok:
-            logger.error("Lighter API HTTP %s for %s %s: %s", resp.status_code, method, url, resp.text[:500])
+            logger.error(
+                "Lighter API HTTP %s for %s %s: %s",
+                resp.status_code,
+                method,
+                url,
+                resp.text[:500],
+            )
             resp.raise_for_status()
 
         try:
@@ -160,17 +167,8 @@ class LighterFundingAPI:
         """
         Нормализует одну запись фандинга в единый формат.
 
-        Попытка угадать стандартные поля:
-        - market_id
-        - symbol
-        - funding_rate_hourly
-        - funding_rate_8h / per_period
-        - next_funding_time
-        и т.д.
-
         Если ставка фандинга равна 0 — возвращает None (чтобы убрать нулевые фандинги).
         """
-        # Пытаемся извлечь идентификатор рынка
         market_id = (
             entry.get("marketId")
             or entry.get("market_id")
@@ -178,7 +176,6 @@ class LighterFundingAPI:
         )
         market_id = str(market_id) if market_id is not None else None
 
-        # Берём символ из карты рынков, либо из самой записи
         symbol = None
         if market_id and market_id in markets_map:
             symbol = markets_map[market_id]["symbol"]
@@ -190,7 +187,6 @@ class LighterFundingAPI:
             or market_id
         )
 
-        # Нормализуем саму ставку (часовую или периодическую)
         funding_rate_hourly = (
             entry.get("hourlyFundingRate")
             or entry.get("fundingRateHourly")
@@ -198,7 +194,6 @@ class LighterFundingAPI:
             or entry.get("funding_rate")
         )
 
-        # Могут быть дополнительные поля (например, прогноз, ставка за период)
         funding_rate_predicted = (
             entry.get("predictedFundingRate")
             or entry.get("predictedFunding")
@@ -216,12 +211,9 @@ class LighterFundingAPI:
             or entry.get("nextFundingTimestamp")
         )
 
-        # Отбрасываем записи, где вообще нет ставки
         if funding_rate_hourly is None and funding_rate_predicted is None and funding_rate_8h is None:
             return None
 
-        # Определяем основную "базовую" ставку,
-        # по которой будем фильтровать нули
         base_rate = funding_rate_hourly
         if base_rate is None:
             base_rate = funding_rate_8h
@@ -231,11 +223,8 @@ class LighterFundingAPI:
         try:
             base_rate_float = float(base_rate)
         except Exception:
-            # если не можем привести к float — всё равно отдаём, но без фильтра нулей
             base_rate_float = None
 
-        # ФИЛЬТР НУЛЕВЫХ ФАНДИНГОВ:
-        # Если есть числовое значение и оно == 0.0 — пропускаем запись
         if base_rate_float is not None and base_rate_float == 0.0:
             return None
 
@@ -257,10 +246,6 @@ class LighterFundingAPI:
         raw = self.get_funding_rates_raw()
         markets_map = self.get_markets_map()
 
-        # Возможные форматы:
-        # 1) список
-        # 2) { "data": [...] }
-        # 3) что-то ещё — пытаемся вытащить лучшее
         if isinstance(raw, dict) and "data" in raw:
             entries = raw.get("data") or []
         elif isinstance(raw, list):
@@ -277,7 +262,6 @@ class LighterFundingAPI:
             if norm is not None:
                 result.append(norm)
 
-        # Можно отсортировать по абсолютной ставке, если нужно
         def _key(e: Dict[str, Any]) -> float:
             v = e.get("funding_rate_hourly") or e.get("funding_rate_8h") or e.get("funding_rate_predicted") or 0
             try:
@@ -289,11 +273,6 @@ class LighterFundingAPI:
         return result
 
     def get_funding_for_symbol(self, symbol: str) -> List[Dict[str, Any]]:
-        """
-        Фандинги (ненулевые) только для конкретного символа (без учёта регистра).
-
-        Например: symbol="BTC-PERP" или "ETH-PERP".
-        """
         symbol_lower = symbol.lower()
         all_items = self.get_all_funding_nonzero()
         return [
@@ -307,12 +286,6 @@ class LighterFundingAPI:
         limit: int = 20,
         min_abs_rate: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Топ рынков по |ставке фандинга| (уже без нулей).
-
-        min_abs_rate — если задано, отфильтровывает по абсолютному значению
-        (например, 0.0001 = 0.01%).
-        """
         all_items = self.get_all_funding_nonzero()
         if min_abs_rate is not None:
             filtered: List[Dict[str, Any]] = []
@@ -355,6 +328,13 @@ class CoinglassAPI:
         self.edgex_headers = {
             "accept": "application/json",
         }
+
+        # Cooldown для EdgeX и Lighter, чтобы не ловить массу 429 Too Many Requests
+        self._edgex_last_attempt = None
+        self._edgex_min_interval_seconds = 300  # EdgeX — не чаще 1 раза в 5 минут
+
+        self._lighter_last_attempt = None
+        self._lighter_min_interval_seconds = 120  # Lighter — не чаще 1 раза в 2 минуты
 
     def _normalize_interval(self, val):
         """
@@ -608,7 +588,6 @@ class CoinglassAPI:
                         except (TypeError, ValueError):
                             continue
 
-                        # funding — доля за 8ч, переводим в проценты за интервал
                         rate_percent = funding * 100.0
 
                         items.append({
@@ -700,26 +679,9 @@ class CoinglassAPI:
     def _get_paradex_funding(self):
         """
         Загрузка ставок фандинга с Paradex через публичный REST API.
-
-        Используем:
-        - GET /v1/markets         — статические данные по рынкам (asset_kind, funding_period_hours, settlement_currency)
-        - GET /v1/markets/summary — динамика по рынкам (funding_rate и т.д.)
-
-        На выходе возвращаем список словарей в том же формате, что и Coinglass/Hyperliquid:
-        {
-            "symbol": "BTC-USD-PERP",
-            "exchangeName": "Paradex",
-            "rate": <проценты за интервал>,
-            "marginType": "USDC",
-            "interval": 8,
-            "nextFundingTime": "",
-            "stableCoin": "USDC",
-            "source": "paradex_markets_summary",
-        }
         """
         items = []
 
-        # 1) Статика: /markets
         markets_meta = {}
         try:
             url_markets = f"{self.paradex_base_url}/markets"
@@ -757,7 +719,6 @@ class CoinglassAPI:
         except Exception as e:
             logger.warning("Paradex: ошибка при разборе /markets: %s", e)
 
-        # 2) Динамика: /markets/summary?market=ALL
         try:
             url_summary = f"{self.paradex_base_url}/markets/summary"
             params = {"market": "ALL"}
@@ -774,7 +735,6 @@ class CoinglassAPI:
                 meta = markets_meta.get(symbol, {})
                 asset_kind = meta.get("asset_kind")
 
-                # если знаем тип рынка — оставляем только PERP
                 if asset_kind:
                     try:
                         if str(asset_kind).upper() != "PERP":
@@ -782,7 +742,6 @@ class CoinglassAPI:
                     except Exception:
                         pass
                 else:
-                    # если статики нет — фильтруем по названию (типичный формат: XXX-USD-PERP)
                     if "-PERP" not in symbol:
                         continue
 
@@ -795,7 +754,6 @@ class CoinglassAPI:
                 except (TypeError, ValueError):
                     continue
 
-                # В API Paradex funding_rate — доля за период, приводим к “процентам за интервал”
                 rate_percent = fr_val * 100.0
 
                 interval_h = meta.get("funding_period_hours", 8.0)
@@ -837,14 +795,28 @@ class CoinglassAPI:
     def _get_edgex_funding(self) -> List[Dict[str, Any]]:
         """
         Загрузка ставок фандинга с EdgeX через публичный REST API.
-
-        Используем:
-        - GET /api/v1/public/meta/getMetaData
-        - GET /api/v1/public/funding/getLatestFundingRate
-
-        Возвращаем список объектов в формате бота.
         """
         items: List[Dict[str, Any]] = []
+
+        # простой cooldown, чтобы не долбить EdgeX каждые 30 секунд
+        try:
+            now = datetime.now(timezone.utc)
+        except Exception:
+            now = datetime.utcnow()
+
+        if self._edgex_last_attempt is not None:
+            try:
+                delta = (now - self._edgex_last_attempt).total_seconds()
+            except Exception:
+                delta = None
+            if delta is not None and delta < self._edgex_min_interval_seconds:
+                logger.info(
+                    "EdgeX: пропускаем запрос фандинга (cooldown ещё %.1f c)",
+                    self._edgex_min_interval_seconds - delta,
+                )
+                return items
+
+        self._edgex_last_attempt = now
 
         contracts_meta: Dict[str, Dict[str, Any]] = {}
         coin_by_id: Dict[str, Dict[str, Any]] = {}
@@ -896,6 +868,7 @@ class CoinglassAPI:
         funding_by_id: Dict[str, Dict[str, Any]] = {}
 
         # 2) bulk getLatestFundingRate
+        bulk_429 = False
         try:
             url_funding = f"{self.edgex_base_url}/api/v1/public/funding/getLatestFundingRate"
             resp = requests.get(url_funding, headers=self.edgex_headers, timeout=10)
@@ -912,11 +885,18 @@ class CoinglassAPI:
                 logger.info("EdgeX getLatestFundingRate (bulk): получено %d записей", len(funding_by_id))
             else:
                 logger.warning("EdgeX getLatestFundingRate (bulk) code != SUCCESS: %s", f_json)
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 429:
+                bulk_429 = True
+                logger.warning("EdgeX: bulk getLatestFundingRate вернул 429 Too Many Requests, перезапросы отключены")
+            else:
+                logger.warning("EdgeX: ошибка bulk getLatestFundingRate, fallback per-contract: %s", e)
         except Exception as e:
             logger.warning("EdgeX: ошибка bulk getLatestFundingRate, fallback per-contract: %s", e)
 
-        # 3) per-contract fallback
-        if not funding_by_id or len(funding_by_id) < len(contracts_meta):
+        # 3) per-contract fallback (если bulk не сработал и это не явный 429)
+        if (not funding_by_id or len(funding_by_id) < len(contracts_meta)) and not bulk_429:
             for cid in contracts_meta.keys():
                 if cid in funding_by_id:
                     continue
@@ -936,8 +916,24 @@ class CoinglassAPI:
                     if not isinstance(data_list, list) or not data_list:
                         continue
                     funding_by_id[cid] = data_list[-1]
+                except requests.exceptions.HTTPError as e:
+                    status = getattr(getattr(e, "response", None), "status_code", None)
+                    if status == 429:
+                        logger.warning(
+                            "EdgeX: 429 Too Many Requests при запросе контракта %s, прекращаем fallback", cid
+                        )
+                        break
+                    logger.warning(
+                        "EdgeX: ошибка getLatestFundingRate для контракта %s: %s",
+                        cid,
+                        e,
+                    )
                 except Exception as e:
-                    logger.warning("EdgeX: ошибка getLatestFundingRate для контракта %s: %s", cid, e)
+                    logger.warning(
+                        "EdgeX: ошибка getLatestFundingRate для контракта %s: %s",
+                        cid,
+                        e,
+                    )
 
         # 4) нормализация
         for cid, meta in contracts_meta.items():
@@ -981,6 +977,27 @@ class CoinglassAPI:
         Использует LighterFundingAPI и приводит данные к формату бота.
         """
         items: List[Dict[str, Any]] = []
+
+        # cooldown, чтобы не долбить Lighter каждые 30 секунд
+        try:
+            now = datetime.now(timezone.utc)
+        except Exception:
+            now = datetime.utcnow()
+
+        if self._lighter_last_attempt is not None:
+            try:
+                delta = (now - self._lighter_last_attempt).total_seconds()
+            except Exception:
+                delta = None
+            if delta is not None and delta < self._lighter_min_interval_seconds:
+                logger.info(
+                    "Lighter: пропускаем запрос фандинга (cooldown ещё %.1f c)",
+                    self._lighter_min_interval_seconds - delta,
+                )
+                return items
+
+        self._lighter_last_attempt = now
+
         try:
             api = LighterFundingAPI(timeout=10)
             raw_items = api.get_all_funding_nonzero()
@@ -999,8 +1016,6 @@ class CoinglassAPI:
             except Exception:
                 continue
 
-            # если есть ставка за 8ч — берём её как интервал 8 часов,
-            # иначе считаем, что ставка почасовая
             if entry.get("funding_rate_8h") is not None:
                 interval_hours = 8.0
             else:
@@ -1229,11 +1244,9 @@ class CryptoArbBot:
         if not data:
             return None
         if funding_type == "negative":
-            # только < 0, нули убираем
             filtered = [item for item in data if item.get("rate", 0) < 0]
             return sorted(filtered, key=lambda x: x["rate"])
         elif funding_type == "positive":
-            # только > 0, нули убираем
             filtered = [item for item in data if item.get("rate", 0) > 0]
             return sorted(filtered, key=lambda x: x["rate"], reverse=True)
         else:
@@ -1270,6 +1283,14 @@ class CryptoArbBot:
         self.application.add_error_handler(self.error_handler)
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Специально игнорируем/логируем конфликт getUpdates, чтобы не спамить трейсами
+        if isinstance(context.error, Conflict):
+            logger.error(
+                "⚠️ Telegram Conflict: бот уже запущен в другом процессе или среде. "
+                "Убедись, что работает только один экземпляр с этим токеном."
+            )
+            return
+
         logger.error("Exception while handling an update:", exc_info=context.error)
         try:
             if update and hasattr(update, "effective_chat"):
@@ -1495,7 +1516,6 @@ class CryptoArbBot:
             await send_method("⚠️ Данные ещё не загружены. Попробуйте через 30 секунд.")
             return
 
-        # Группируем по символам
         symbol_data = {}
         for item in self.funding_cache:
             symbol = item.get("symbol", "")
@@ -1555,7 +1575,6 @@ class CryptoArbBot:
             await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
             return
 
-        # Пагинация
         items_per_page = 10
         total_items = len(opportunities)
         total_pages = (total_items + items_per_page - 1) // items_per_page
@@ -1650,7 +1669,6 @@ class CryptoArbBot:
         response = "<b>🏛️ Все доступные биржи</b>\n\n"
         response += f"📊 Всего бирж: {len(exchanges)}\n\n"
 
-        # Текстовый список бирж
         per_line = 3
         for i in range(0, len(exchanges), per_line):
             line = exchanges[i:i+per_line]
@@ -1669,7 +1687,6 @@ class CryptoArbBot:
             cache_time = self.funding_cache_updated_at.strftime("%H:%M:%S")
             response += f"\n🕒 <i>Данные обновлены: {cache_time} UTC</i>"
 
-        # Кнопки по биржам
         keyboard = []
         row = []
         for ex in exchanges:
@@ -1771,7 +1788,7 @@ class CryptoArbBot:
             item for item in self.funding_cache
             if isinstance(item.get("exchangeName"), str)
             and item["exchangeName"].lower() == "hyperliquid"
-            and float(item.get("rate") or 0.0) != 0.0  # убрали нулевые фандинги
+            and float(item.get("rate") or 0.0) != 0.0
         ]
 
         if not hl_items:
@@ -1887,7 +1904,7 @@ class CryptoArbBot:
             item for item in self.funding_cache
             if isinstance(item.get("exchangeName"), str)
             and item["exchangeName"].lower() == exchange_name.lower()
-            and float(item.get("rate") or 0.0) != 0.0  # убираем нулевые фандинги
+            and float(item.get("rate") or 0.0) != 0.0
         ]
 
         if not ex_items:
@@ -1898,7 +1915,6 @@ class CryptoArbBot:
             await send_method(msg, parse_mode="HTML")
             return
 
-        # Сортируем по абсолютному APR (по модулю)
         items_sorted = sorted(
             ex_items,
             key=lambda x: abs(self.annualize_rate(float(x.get("rate") or 0.0), x.get("interval", 8))),
