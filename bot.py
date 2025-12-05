@@ -245,7 +245,7 @@ class LighterFundingAPI:
         if isinstance(raw, dict):
             # стандартный случай: {"code":0,"data":[...]} или похожее
             if "data" in raw and isinstance(raw["data"], list):
-                entries = raw["data"] or []
+                entries = raw.get("data") or []
             else:
                 # ищем первый список в значениях
                 list_candidates = [v for v in raw.values() if isinstance(v, list)]
@@ -348,12 +348,14 @@ class CoinglassAPI:
             "accept": "application/json",
         }
 
-        # Cooldown для EdgeX и Lighter
-        self._edgex_last_attempt = None
-        self._edgex_min_interval_seconds = 300  # 5 минут
+        # Cooldown для EdgeX и Lighter + кэш их записей
+        self._edgex_last_attempt: Optional[datetime] = None
+        self._edgex_min_interval_seconds = 300  # 5 минут между попытками сетевого запроса
+        self._edgex_cache_items: List[Dict[str, Any]] = []
 
-        self._lighter_last_attempt = None
-        self._lighter_min_interval_seconds = 120  # 2 минуты
+        self._lighter_last_attempt: Optional[datetime] = None
+        self._lighter_min_interval_seconds = 300  # 5 минут между запросами к Lighter
+        self._lighter_cache_items: List[Dict[str, Any]] = []
 
     def _normalize_interval(self, val):
         """
@@ -390,7 +392,7 @@ class CoinglassAPI:
                     return None
 
                 entries = data.get("data", [])
-                result = []
+                result: List[Dict[str, Any]] = []
 
                 for entry in entries:
                     sym = entry.get("symbol", "")
@@ -451,13 +453,13 @@ class CoinglassAPI:
                 except Exception as log_ex:
                     logger.warning("Не удалось залогировать список бирж: %s", log_ex)
 
-                # Добавляем Hyperliquid из нативного API
+                # Hyperliquid
                 try:
                     hl_items = self._get_hyperliquid_funding()
                     if hl_items:
                         existing_keys = {
-                            (str(row.get("symbol")), str(row.get("exchangeName")).lower())
-                            for row in result
+                            (str(r.get("symbol")), str(r.get("exchangeName")).lower())
+                            for r in result
                         }
                         added = 0
                         for it in hl_items:
@@ -467,22 +469,19 @@ class CoinglassAPI:
                             result.append(it)
                             existing_keys.add(key)
                             added += 1
-                        logger.info(
-                            "Hyperliquid: добавлено %d новых записей в общий кэш фандинга",
-                            added,
-                        )
+                        logger.info("Hyperliquid: добавлено %d новых записей", added)
                     else:
                         logger.info("Hyperliquid: нативный API вернул 0 записей")
                 except Exception as hl_ex:
                     logger.warning("Ошибка при добавлении Hyperliquid: %s", hl_ex)
 
-                # Добавляем Paradex из нативного API
+                # Paradex
                 try:
                     pdx_items = self._get_paradex_funding()
                     if pdx_items:
                         existing_keys = {
-                            (str(row.get("symbol")), str(row.get("exchangeName")).lower())
-                            for row in result
+                            (str(r.get("symbol")), str(r.get("exchangeName")).lower())
+                            for r in result
                         }
                         added = 0
                         for it in pdx_items:
@@ -492,22 +491,19 @@ class CoinglassAPI:
                             result.append(it)
                             existing_keys.add(key)
                             added += 1
-                        logger.info(
-                            "Paradex: добавлено %d новых записей в общий кэш фандинга",
-                            added,
-                        )
+                        logger.info("Paradex: добавлено %d новых записей", added)
                     else:
                         logger.info("Paradex: нативный API вернул 0 записей")
                 except Exception as pdx_ex:
                     logger.warning("Ошибка при добавлении Paradex: %s", pdx_ex)
 
-                # Добавляем EdgeX из нативного API
+                # EdgeX
                 try:
                     edgex_items = self._get_edgex_funding()
                     if edgex_items:
                         existing_keys = {
-                            (str(row.get("symbol")), str(row.get("exchangeName")).lower())
-                            for row in result
+                            (str(r.get("symbol")), str(r.get("exchangeName")).lower())
+                            for r in result
                         }
                         added = 0
                         for it in edgex_items:
@@ -517,22 +513,19 @@ class CoinglassAPI:
                             result.append(it)
                             existing_keys.add(key)
                             added += 1
-                        logger.info(
-                            "EdgeX: добавлено %d новых записей в общий кэш фандинга",
-                            added,
-                        )
+                        logger.info("EdgeX: добавлено %d новых записей", added)
                     else:
-                        logger.info("EdgeX: нативный API вернул 0 записей")
+                        logger.info("EdgeX: нативный API вернул 0 записей (используем кэш)")
                 except Exception as edx_ex:
                     logger.warning("Ошибка при добавлении EdgeX: %s", edx_ex)
 
-                # Добавляем Lighter из нативного API
+                # Lighter
                 try:
                     lighter_items = self._get_lighter_funding()
                     if lighter_items:
                         existing_keys = {
-                            (str(row.get("symbol")), str(row.get("exchangeName")).lower())
-                            for row in result
+                            (str(r.get("symbol")), str(r.get("exchangeName")).lower())
+                            for r in result
                         }
                         added = 0
                         for it in lighter_items:
@@ -542,12 +535,9 @@ class CoinglassAPI:
                             result.append(it)
                             existing_keys.add(key)
                             added += 1
-                        logger.info(
-                            "Lighter: добавлено %d новых записей в общий кэш фандинга",
-                            added,
-                        )
+                        logger.info("Lighter: добавлено %d новых записей", added)
                     else:
-                        logger.info("Lighter: нативный API вернул 0 записей")
+                        logger.info("Lighter: нативный API вернул 0 записей (используем кэш)")
                 except Exception as l_ex:
                     logger.warning("Ошибка при добавлении Lighter: %s", l_ex)
 
@@ -574,7 +564,7 @@ class CoinglassAPI:
         Дополнительная загрузка ставок фандинга с биржи Hyperliquid
         (metaAndAssetCtxs + predictedFundings)
         """
-        items = []
+        items: List[Dict[str, Any]] = []
 
         # 1) metaAndAssetCtxs — текущий funding
         try:
@@ -699,9 +689,9 @@ class CoinglassAPI:
         """
         Загрузка ставок фандинга с Paradex через публичный REST API.
         """
-        items = []
+        items: List[Dict[str, Any]] = []
 
-        markets_meta = {}
+        markets_meta: Dict[str, Dict[str, Any]] = {}
         try:
             url_markets = f"{self.paradex_base_url}/markets"
             resp = requests.get(url_markets, headers=self.paradex_headers, timeout=10)
@@ -814,6 +804,10 @@ class CoinglassAPI:
     def _get_edgex_funding(self) -> List[Dict[str, Any]]:
         """
         Загрузка ставок фандинга с EdgeX через публичный REST API.
+
+        ВАЖНО:
+        - Учитываем лимиты: не ходим к API чаще, чем раз в self._edgex_min_interval_seconds
+        - Если API недоступен или отдаёт 0 записей, но есть кэш — возвращаем кэш
         """
         items: List[Dict[str, Any]] = []
 
@@ -828,11 +822,18 @@ class CoinglassAPI:
             except Exception:
                 delta = None
             if delta is not None and delta < self._edgex_min_interval_seconds:
+                if self._edgex_cache_items:
+                    logger.info(
+                        "EdgeX: используем кэш (%d записей), до следующего запроса %.1f c",
+                        len(self._edgex_cache_items),
+                        self._edgex_min_interval_seconds - delta,
+                    )
+                    return list(self._edgex_cache_items)
                 logger.info(
-                    "EdgeX: пропускаем запрос фандинга (cooldown ещё %.1f c)",
+                    "EdgeX: cooldown %.1f c, кэша нет, пропускаем запрос",
                     self._edgex_min_interval_seconds - delta,
                 )
-                return items
+                return []
 
         self._edgex_last_attempt = now
 
@@ -847,7 +848,7 @@ class CoinglassAPI:
 
             if meta_json.get("code") != "SUCCESS":
                 logger.warning("EdgeX meta/getMetaData error: %s", meta_json)
-                return items
+                return list(self._edgex_cache_items)
 
             data = meta_json.get("data") or {}
 
@@ -871,10 +872,10 @@ class CoinglassAPI:
             logger.info("EdgeX meta/getMetaData: загружено %d активных контрактов", len(contracts_meta))
         except Exception as e:
             logger.warning("EdgeX: ошибка при запросе meta/getMetaData: %s", e)
-            return items
+            return list(self._edgex_cache_items)
 
         if not contracts_meta:
-            return items
+            return list(self._edgex_cache_items)
 
         def _safe_float(x: Any) -> Optional[float]:
             try:
@@ -905,16 +906,23 @@ class CoinglassAPI:
             status = getattr(getattr(e, "response", None), "status_code", None)
             if status == 429:
                 bulk_429 = True
-                logger.warning("EdgeX: bulk getLatestFundingRate вернул 429 Too Many Requests, перезапросы отключены")
+                logger.warning("EdgeX: bulk getLatestFundingRate вернул 429 Too Many Requests, fallback отключён")
             else:
                 logger.warning("EdgeX: ошибка bulk getLatestFundingRate, fallback per-contract: %s", e)
         except Exception as e:
             logger.warning("EdgeX: ошибка bulk getLatestFundingRate, fallback per-contract: %s", e)
 
+        # per-contract fallback (ограничен по количеству, чтобы не словить 429)
         if (not funding_by_id or len(funding_by_id) < len(contracts_meta)) and not bulk_429:
+            max_contracts_per_run = 20
+            processed = 0
+
             for cid in contracts_meta.keys():
                 if cid in funding_by_id:
                     continue
+                if processed >= max_contracts_per_run:
+                    break
+                processed += 1
                 try:
                     url_funding = f"{self.edgex_base_url}/api/v1/public/funding/getLatestFundingRate"
                     resp = requests.get(
@@ -950,6 +958,7 @@ class CoinglassAPI:
                         e,
                     )
 
+        # нормализация
         for cid, meta in contracts_meta.items():
             fr = funding_by_id.get(cid)
             if not fr:
@@ -983,11 +992,22 @@ class CoinglassAPI:
             })
 
         logger.info("EdgeX: нормализовано %d записей funding", len(items))
+
+        if items:
+            self._edgex_cache_items = items
+        elif self._edgex_cache_items:
+            # если новых нет, но есть старый кэш — используем его
+            logger.info("EdgeX: новых записей нет, возвращаем кэш (%d записей)", len(self._edgex_cache_items))
+            return list(self._edgex_cache_items)
+
         return items
 
     def _get_lighter_funding(self) -> List[Dict[str, Any]]:
         """
         Загрузка ставок фандинга с Lighter через публичный API.
+
+        - Учитываем cooldown
+        - При ошибке/нулевом ответе возвращаем кэш, если он есть
         """
         items: List[Dict[str, Any]] = []
 
@@ -1002,11 +1022,18 @@ class CoinglassAPI:
             except Exception:
                 delta = None
             if delta is not None and delta < self._lighter_min_interval_seconds:
+                if self._lighter_cache_items:
+                    logger.info(
+                        "Lighter: используем кэш (%d записей), до следующего запроса %.1f c",
+                        len(self._lighter_cache_items),
+                        self._lighter_min_interval_seconds - delta,
+                    )
+                    return list(self._lighter_cache_items)
                 logger.info(
-                    "Lighter: пропускаем запрос фандинга (cooldown ещё %.1f c)",
+                    "Lighter: cooldown %.1f c, кэша нет, пропускаем запрос",
                     self._lighter_min_interval_seconds - delta,
                 )
-                return items
+                return []
 
         self._lighter_last_attempt = now
 
@@ -1015,7 +1042,7 @@ class CoinglassAPI:
             raw_items = api.get_all_funding_nonzero()
         except Exception as e:
             logger.warning("Lighter: ошибка при запросе фандинга: %s", e)
-            return items
+            return list(self._lighter_cache_items)
 
         for entry in raw_items:
             base = (
@@ -1053,6 +1080,13 @@ class CoinglassAPI:
             })
 
         logger.info("Lighter: нормализовано %d записей funding", len(items))
+
+        if items:
+            self._lighter_cache_items = items
+        elif self._lighter_cache_items:
+            logger.info("Lighter: новых записей нет, возвращаем кэш (%d записей)", len(self._lighter_cache_items))
+            return list(self._lighter_cache_items)
+
         return items
 
     def get_arbitrage_opportunities(self):
@@ -1425,6 +1459,12 @@ class CryptoArbBot:
                 f"ставка за интервал: {raw_rate:.6f}%\n\n"
             )
 
+        if self.funding_cache_updated_at:
+            cache_time = self.funding_cache_updated_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        else:
+            cache_time = "ещё не обновлялся"
+        response += f"\n🕒 <i>Кэш фандинга обновлён: {cache_time}</i>\n"
+
         keyboard = []
         if total_pages > 1:
             nav_buttons = []
@@ -1509,8 +1549,10 @@ class CryptoArbBot:
             )
 
         if self.funding_cache_updated_at:
-            cache_time = self.funding_cache_updated_at.strftime("%H:%M:%S")
-            response += f"\n🕒 <i>Данные обновлены: {cache_time} UTC</i>"
+            cache_time = self.funding_cache_updated_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        else:
+            cache_time = "ещё не обновлялся"
+        response += f"\n🕒 <i>Кэш фандинга обновлён: {cache_time}</i>"
 
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
@@ -1583,6 +1625,11 @@ class CryptoArbBot:
                 "• Недостаточно данных по марже\n"
                 "• Рынок в состоянии равновесия"
             )
+            if self.funding_cache_updated_at:
+                cache_time = self.funding_cache_updated_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            else:
+                cache_time = "ещё не обновлялся"
+            response += f"\n\n🕒 <i>Кэш фандинга обновлён: {cache_time}</i>"
             keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
             await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
             return
@@ -1629,6 +1676,12 @@ class CryptoArbBot:
                 f"(интервал: {opp['max_interval']}ч, ставка за интервал: {opp['max_rate']:.6f}%)\n"
             )
             response += f" 💰 Спред (APR): {spread_annual_str}\n\n"
+
+        if self.funding_cache_updated_at:
+            cache_time = self.funding_cache_updated_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        else:
+            cache_time = "ещё не обновлялся"
+        response += f"\n🕒 <i>Кэш фандинга обновлён: {cache_time}</i>\n"
 
         keyboard = []
         if total_pages > 1:
@@ -1696,8 +1749,10 @@ class CryptoArbBot:
         response += f"• Бирж: {len(exchanges)}\n"
 
         if self.funding_cache_updated_at:
-            cache_time = self.funding_cache_updated_at.strftime("%H:%M:%S")
-            response += f"\n🕒 <i>Данные обновлены: {cache_time} UTC</i>"
+            cache_time = self.funding_cache_updated_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        else:
+            cache_time = "ещё не обновлялся"
+        response += f"\n🕒 <i>Кэш фандинга обновлён: {cache_time}</i>"
 
         keyboard = []
         row = []
@@ -1729,7 +1784,13 @@ class CryptoArbBot:
 
         opportunities = self.api.get_arbitrage_opportunities()
         if not opportunities:
-            await send_method("🤷‍♂️ Арбитражные возможности по цене не найдены")
+            text = "🤷‍♂️ Арбитражные возможности по цене не найдены"
+            if self.funding_cache_updated_at:
+                cache_time = self.funding_cache_updated_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            else:
+                cache_time = "ещё не обновлялся"
+            text += f"\n\n🕒 <i>Кэш фандинга обновлён: {cache_time}</i>"
+            await send_method(text, parse_mode="HTML")
             return
 
         response = "💸 <b>Арбитражные возможности по цене (BTC):</b>\n\n"
@@ -1738,6 +1799,12 @@ class CryptoArbBot:
             response += f" 📊 Спред: {opp['spread_percent']}%\n"
             response += f" 💰 Мин: ${opp['min_price']:.2f}\n"
             response += f" 💰 Макс: ${opp['max_price']:.2f}\n\n"
+
+        if self.funding_cache_updated_at:
+            cache_time = self.funding_cache_updated_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        else:
+            cache_time = "ещё не обновлялся"
+        response += f"\n🕒 <i>Кэш фандинга обновлён: {cache_time}</i>"
 
         keyboard = [[InlineKeyboardButton("📋 Главное меню", callback_data="nav_main")]]
         await send_method(response, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
@@ -1815,6 +1882,11 @@ class CryptoArbBot:
                 "\"Hyperliquid metaAndAssetCtxs\" или \"Hyperliquid predictedFundings\" "
                 "с количеством записей.</i>"
             )
+            if self.funding_cache_updated_at:
+                cache_time = self.funding_cache_updated_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            else:
+                cache_time = "ещё не обновлялся"
+            msg += f"\n\n🕒 <i>Кэш фандинга обновлён: {cache_time}</i>"
             await send_method(msg, parse_mode="HTML")
             return
 
@@ -1858,6 +1930,12 @@ class CryptoArbBot:
                 f"| ставка за интервал: {raw_rate:.6f}%\n\n"
             )
 
+        if self.funding_cache_updated_at:
+            cache_time = self.funding_cache_updated_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        else:
+            cache_time = "ещё не обновлялся"
+        response += f"\n🕒 <i>Кэш фандинга обновлён: {cache_time}</i>\n"
+
         keyboard = []
         if total_pages > 1:
             nav_buttons = []
@@ -1900,7 +1978,6 @@ class CryptoArbBot:
 
         ex_lower = exchange_name.lower()
 
-        # Если уже есть записи по этой бирже — ничего не делаем
         if any(
             isinstance(item.get("exchangeName"), str) and item["exchangeName"].lower() == ex_lower
             for item in self.funding_cache
@@ -1911,7 +1988,7 @@ class CryptoArbBot:
 
         try:
             if ex_lower == "edgex":
-                # сбрасываем cooldown для ручной попытки
+                # сбрасываем cooldown и пробуем один сетевой запрос
                 self.api._edgex_last_attempt = None
                 new_items = await asyncio.to_thread(self.api._get_edgex_funding)
             elif ex_lower == "lighter":
@@ -1967,6 +2044,11 @@ class CryptoArbBot:
                 "<i>Возможные причины: биржа не отдаёт публичный фандинг, временные лимиты (429) "
                 "или ещё ни разу не удалось успешно запросить API.</i>"
             )
+            if self.funding_cache_updated_at:
+                cache_time = self.funding_cache_updated_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            else:
+                cache_time = "ещё не обновлялся"
+            msg += f"\n\n🕒 <i>Кэш фандинга обновлён: {cache_time}</i>"
             await send_method(msg, parse_mode="HTML")
             return
 
@@ -2011,6 +2093,12 @@ class CryptoArbBot:
                 f"  💰 {annual_str} | ⏰ интервал: {interval}ч "
                 f"| ставка за интервал: {raw_rate:.6f}%\n\n"
             )
+
+        if self.funding_cache_updated_at:
+            cache_time = self.funding_cache_updated_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        else:
+            cache_time = "ещё не обновлялся"
+        response += f"\n🕒 <i>Кэш фандинга обновлён: {cache_time}</i>\n"
 
         keyboard = []
         if total_pages > 1:
