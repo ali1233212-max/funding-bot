@@ -113,7 +113,7 @@ class LighterFundingAPI:
         elif isinstance(data, list):
             markets_list = data
         else:
-            logger.warning("Unexpected markets response format from Lighter: %s", type(data))
+            logger.warning("Unexpected markets response format from Lighter: %r", data)
             markets_list = []
 
         for item in markets_list:
@@ -126,7 +126,6 @@ class LighterFundingAPI:
                 or item.get("market_id")
             )
             if not market_id:
-                # если нет явного id — пропускаем
                 continue
 
             symbol = (
@@ -152,9 +151,6 @@ class LighterFundingAPI:
         Сырой вызов текущих ставок фандинга.
 
         Эндпоинт: GET https://mainnet.zklighter.elliot.ai/api/v1/funding-rates
-
-        params — оставляю на будущее (если понадобится фильтрация по marketId и т.п.).
-        Сейчас можно вызывать без параметров для получения всех рынков.
         """
         url = f"{self.BASE_URL}/funding-rates"
         return self._request("GET", url, params=params)
@@ -246,12 +242,35 @@ class LighterFundingAPI:
         raw = self.get_funding_rates_raw()
         markets_map = self.get_markets_map()
 
-        if isinstance(raw, dict) and "data" in raw:
-            entries = raw.get("data") or []
+        if isinstance(raw, dict):
+            # стандартный случай: {"code":0,"data":[...]} или похожее
+            if "data" in raw and isinstance(raw["data"], list):
+                entries = raw["data"] or []
+            else:
+                # ищем первый список в значениях
+                list_candidates = [v for v in raw.values() if isinstance(v, list)]
+                if list_candidates:
+                    entries = list_candidates[0]
+                else:
+                    code = raw.get("code")
+                    msg = raw.get("message") or raw.get("msg") or raw.get("error")
+                    if code not in (None, 0):
+                        logger.warning(
+                            "Lighter funding-rates API returned error code %s, message: %s",
+                            code,
+                            msg,
+                        )
+                        entries = []
+                    else:
+                        logger.warning(
+                            "Unexpected funding-rates response body from Lighter: %r",
+                            raw,
+                        )
+                        entries = []
         elif isinstance(raw, list):
             entries = raw
         else:
-            logger.warning("Unexpected funding-rates response format from Lighter: %s", type(raw))
+            logger.warning("Unexpected funding-rates response type from Lighter: %r", type(raw))
             entries = []
 
         result: List[Dict[str, Any]] = []
@@ -329,12 +348,12 @@ class CoinglassAPI:
             "accept": "application/json",
         }
 
-        # Cooldown для EdgeX и Lighter, чтобы не ловить массу 429 Too Many Requests
+        # Cooldown для EdgeX и Lighter
         self._edgex_last_attempt = None
-        self._edgex_min_interval_seconds = 300  # EdgeX — не чаще 1 раза в 5 минут
+        self._edgex_min_interval_seconds = 300  # 5 минут
 
         self._lighter_last_attempt = None
-        self._lighter_min_interval_seconds = 120  # Lighter — не чаще 1 раза в 2 минуты
+        self._lighter_min_interval_seconds = 120  # 2 минуты
 
     def _normalize_interval(self, val):
         """
@@ -798,7 +817,6 @@ class CoinglassAPI:
         """
         items: List[Dict[str, Any]] = []
 
-        # простой cooldown, чтобы не долбить EdgeX каждые 30 секунд
         try:
             now = datetime.now(timezone.utc)
         except Exception:
@@ -821,7 +839,6 @@ class CoinglassAPI:
         contracts_meta: Dict[str, Dict[str, Any]] = {}
         coin_by_id: Dict[str, Dict[str, Any]] = {}
 
-        # 1) meta
         try:
             url_meta = f"{self.edgex_base_url}/api/v1/public/meta/getMetaData"
             resp = requests.get(url_meta, headers=self.edgex_headers, timeout=10)
@@ -867,7 +884,6 @@ class CoinglassAPI:
 
         funding_by_id: Dict[str, Dict[str, Any]] = {}
 
-        # 2) bulk getLatestFundingRate
         bulk_429 = False
         try:
             url_funding = f"{self.edgex_base_url}/api/v1/public/funding/getLatestFundingRate"
@@ -895,7 +911,6 @@ class CoinglassAPI:
         except Exception as e:
             logger.warning("EdgeX: ошибка bulk getLatestFundingRate, fallback per-contract: %s", e)
 
-        # 3) per-contract fallback (если bulk не сработал и это не явный 429)
         if (not funding_by_id or len(funding_by_id) < len(contracts_meta)) and not bulk_429:
             for cid in contracts_meta.keys():
                 if cid in funding_by_id:
@@ -935,7 +950,6 @@ class CoinglassAPI:
                         e,
                     )
 
-        # 4) нормализация
         for cid, meta in contracts_meta.items():
             fr = funding_by_id.get(cid)
             if not fr:
@@ -974,11 +988,9 @@ class CoinglassAPI:
     def _get_lighter_funding(self) -> List[Dict[str, Any]]:
         """
         Загрузка ставок фандинга с Lighter через публичный API.
-        Использует LighterFundingAPI и приводит данные к формату бота.
         """
         items: List[Dict[str, Any]] = []
 
-        # cooldown, чтобы не долбить Lighter каждые 30 секунд
         try:
             now = datetime.now(timezone.utc)
         except Exception:
@@ -1158,8 +1170,8 @@ class CryptoArbBot:
     def __init__(self):
         self.api = CoinglassAPI()
         self.application = Application.builder().token(TELEGRAM_TOKEN).build()
-        self.funding_cache = []
-        self.funding_cache_updated_at = None
+        self.funding_cache: List[Dict[str, Any]] = []
+        self.funding_cache_updated_at: Optional[datetime] = None
         self.cache_lock = asyncio.Lock()
 
         self.MIN_ABS_RATE = 1e-6
@@ -1283,9 +1295,9 @@ class CryptoArbBot:
         self.application.add_error_handler(self.error_handler)
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Специально игнорируем/логируем конфликт getUpdates, чтобы не спамить трейсами
+        # Telegram conflict (двойной getUpdates) — это не наш баг, просто логируем мягко
         if isinstance(context.error, Conflict):
-            logger.error(
+            logger.warning(
                 "⚠️ Telegram Conflict: бот уже запущен в другом процессе или среде. "
                 "Убедись, что работает только один экземпляр с этим токеном."
             )
@@ -1878,12 +1890,54 @@ class CryptoArbBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         await send_method(response, reply_markup=reply_markup, parse_mode="HTML")
 
+    async def ensure_exchange_data(self, exchange_name: str):
+        """
+        Ручная подгрузка фандингов по бирже (используется для /edgex и /lighter),
+        если в кэше пока нет записей этой биржи.
+        """
+        if not self.funding_cache:
+            return
+
+        ex_lower = exchange_name.lower()
+
+        # Если уже есть записи по этой бирже — ничего не делаем
+        if any(
+            isinstance(item.get("exchangeName"), str) and item["exchangeName"].lower() == ex_lower
+            for item in self.funding_cache
+        ):
+            return
+
+        logger.info("%s: в кэше нет записей, пробуем ручную подгрузку...", exchange_name)
+
+        try:
+            if ex_lower == "edgex":
+                # сбрасываем cooldown для ручной попытки
+                self.api._edgex_last_attempt = None
+                new_items = await asyncio.to_thread(self.api._get_edgex_funding)
+            elif ex_lower == "lighter":
+                self.api._lighter_last_attempt = None
+                new_items = await asyncio.to_thread(self.api._get_lighter_funding)
+            else:
+                return
+
+            if new_items:
+                self.funding_cache.extend(new_items)
+                logger.info(
+                    "%s: вручную добавлено %d записей по запросу пользователя",
+                    exchange_name,
+                    len(new_items),
+                )
+        except Exception as e:
+            logger.warning("%s: ошибка при ручной подгрузке фандингов: %s", exchange_name, e)
+
     async def show_edgex(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
         """Обёртка для отображения только биржи EdgeX через команду /edgex"""
+        await self.ensure_exchange_data("EdgeX")
         await self.show_exchange_funding(update, context, "EdgeX", page)
 
     async def show_lighter(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1):
         """Обёртка для отображения только биржи Lighter через команду /lighter"""
+        await self.ensure_exchange_data("Lighter")
         await self.show_exchange_funding(update, context, "Lighter", page)
 
     async def show_exchange_funding(self, update: Update, context: ContextTypes.DEFAULT_TYPE, exchange_name: str, page: int = 1):
@@ -1904,13 +1958,14 @@ class CryptoArbBot:
             item for item in self.funding_cache
             if isinstance(item.get("exchangeName"), str)
             and item["exchangeName"].lower() == exchange_name.lower()
-            and float(item.get("rate") or 0.0) != 0.0
         ]
 
         if not ex_items:
             msg = (
                 f"{self.get_exchange_emoji(exchange_name)} <b>{exchange_name}</b>\n\n"
-                "В текущем кэше нет ни одной записи с ненулевым фандингом по этой бирже."
+                "В текущем кэше нет ни одной записи по этой бирже.\n\n"
+                "<i>Возможные причины: биржа не отдаёт публичный фандинг, временные лимиты (429) "
+                "или ещё ни разу не удалось успешно запросить API.</i>"
             )
             await send_method(msg, parse_mode="HTML")
             return
@@ -1939,7 +1994,7 @@ class CryptoArbBot:
         ex_emoji = self.get_exchange_emoji(exchange_name)
         response = f"{ex_emoji} <b>{exchange_name}: funding (APR)</b>\n\n"
         response += f"📊 Всего записей: {total_items} | Страница {page}/{total_pages}\n"
-        response += "💡 Показаны только ненулевые ставки, пересчитанные в годовые (APR).\n\n"
+        response += "💡 Показаны все ставки (включая нулевые), пересчитанные в годовые (APR).\n\n"
 
         for item in page_data:
             symbol = item.get("symbol", "N/A")
